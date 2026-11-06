@@ -1,0 +1,280 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Core Authorization Helpers
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Super Admin: Strictly requires verified identity for owner vivekn528@gmail.com
+    function isSuperAdmin() {
+      return isAuthenticated() && 
+             request.auth.token.email == 'vivekn528@gmail.com' &&
+             request.auth.token.email_verified == true;
+    }
+
+    function isOwnerUser(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // 1. Platform Settings: Public reads, strictly Super Admin writes
+    match /platform_settings/{settingId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    // 2. User Profiles & Addresses
+    match /users/{userId} {
+      // Private profile: Only the user and Super Admin can read
+      allow read: if isOwnerUser(userId) || isSuperAdmin();
+      
+      // On creation: Users can create their own profile, but CANNOT self-assign protected roles
+      allow create: if isOwnerUser(userId) && (
+        !('role' in request.resource.data) || request.resource.data.role == 'customer'
+      ) || isSuperAdmin();
+      
+      // On update: Users CANNOT change or add their role field. Only Super Admin can change roles.
+      allow update: if isOwnerUser(userId) && (
+        !('role' in request.resource.data) || request.resource.data.role == resource.data.role
+      ) || isSuperAdmin();
+
+      allow delete: if isSuperAdmin();
+
+      match /addresses/{addressId} {
+        allow read, write: if isOwnerUser(userId) || isSuperAdmin();
+      }
+    }
+
+    // 3. Cooks / Kitchens
+    match /cooks/{cookId} {
+      // Public can view verified kitchens; unverified only visible to owner and admin
+      allow read: if resource.data.isVerified == true || 
+                     (isAuthenticated() && resource.data.userId == request.auth.uid) || 
+                     isSuperAdmin();
+                     
+      // New cook registration: cannot self-verify or self-approve
+      allow create: if isAuthenticated() && (
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.isVerified == false &&
+        request.resource.data.verificationStatus == 'pending'
+      ) || isSuperAdmin();
+      
+      // Cooks can update kitchen details, but CANNOT alter userId, verification, commission, or ratings
+      allow update: if isSuperAdmin() || (
+        isAuthenticated() && resource.data.userId == request.auth.uid &&
+        request.resource.data.userId == resource.data.userId &&
+        request.resource.data.isVerified == resource.data.isVerified &&
+        request.resource.data.verificationStatus == resource.data.verificationStatus &&
+        request.resource.data.commissionRatePercent == resource.data.commissionRatePercent &&
+        request.resource.data.rating == resource.data.rating &&
+        request.resource.data.reviewCount == resource.data.reviewCount
+      );
+      
+      allow delete: if isSuperAdmin();
+    }
+
+    // 4. Menu Items: Isolated to Verified Kitchen Owner
+    match /menu_items/{itemId} {
+      allow read: if true;
+      
+      // Cook creating item must set cookUserId to their own auth UID
+      allow create: if isAuthenticated() && (
+        request.resource.data.cookUserId == request.auth.uid || isSuperAdmin()
+      );
+      
+      // Cook cannot modify another cook's items or transfer cookUserId
+      allow update: if isSuperAdmin() || (
+        isAuthenticated() && resource.data.cookUserId == request.auth.uid &&
+        request.resource.data.cookUserId == resource.data.cookUserId &&
+        request.resource.data.cookId == resource.data.cookId
+      );
+      
+      allow delete: if isSuperAdmin() || (
+        isAuthenticated() && resource.data.cookUserId == request.auth.uid
+      );
+    }
+
+    // 5. Orders: Server-Authoritative Creation & Role-Based Field Protections
+    match /orders/{orderId} {
+      // Visibility: Customer, Cook, Assigned Rider, or Super Admin
+      allow read: if isAuthenticated() && (
+        resource.data.customerId == request.auth.uid ||
+        resource.data.cookUserId == request.auth.uid ||
+        resource.data.deliveryPartnerUserId == request.auth.uid ||
+        isSuperAdmin()
+      );
+      
+      // Order Creation: Created exclusively by server-authoritative Cloud Functions
+      // via the Firebase Admin SDK (which bypasses security rules).
+      // Direct Web SDK client-side order creation is completely disallowed for all users.
+      allow create: if false;
+      
+      // Field-Level Guard: All updates by non-admins MUST preserve financial, pricing, and ownership fields
+      allow update: if isSuperAdmin() || (
+        isAuthenticated() &&
+        // Strict immutable financial & ownership fields (cannot be changed by customer, cook, or rider):
+        request.resource.data.customerId == resource.data.customerId &&
+        request.resource.data.cookUserId == resource.data.cookUserId &&
+        request.resource.data.cookId == resource.data.cookId &&
+        request.resource.data.items == resource.data.items &&
+        request.resource.data.itemsSubtotal == resource.data.itemsSubtotal &&
+        request.resource.data.deliveryFee == resource.data.deliveryFee &&
+        request.resource.data.platformFee == resource.data.platformFee &&
+        request.resource.data.packagingFee == resource.data.packagingFee &&
+        request.resource.data.discount == resource.data.discount &&
+        request.resource.data.discountCode == resource.data.discountCode &&
+        request.resource.data.discountFunding == resource.data.discountFunding &&
+        request.resource.data.finalPayableAmount == resource.data.finalPayableAmount &&
+        request.resource.data.platformCommission == resource.data.platformCommission &&
+        request.resource.data.cookEarnings == resource.data.cookEarnings &&
+        request.resource.data.paymentMethod == resource.data.paymentMethod &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        
+        // Role-based state transitions:
+        (
+          // 1. Customer: Can ONLY cancel while pending with affectedKeys strictly constrained to cancellation fields
+          (
+            resource.data.customerId == request.auth.uid &&
+            resource.data.status == 'pending' &&
+            request.resource.data.status == 'cancelled' &&
+            request.resource.data.paymentStatus == resource.data.paymentStatus &&
+            request.resource.data.deliveryPartnerId == resource.data.deliveryPartnerId &&
+            request.resource.data.deliveryPartnerUserId == resource.data.deliveryPartnerUserId &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancellationReason', 'updatedAt', 'events'])
+          ) ||
+          // 2. Cook: Can accept, prepare, or mark ready. Cannot reassign delivery partner, alter customer, or change paymentStatus
+          (
+            resource.data.cookUserId == request.auth.uid &&
+            request.resource.data.paymentStatus == resource.data.paymentStatus &&
+            request.resource.data.deliveryPartnerId == resource.data.deliveryPartnerId &&
+            request.resource.data.deliveryPartnerUserId == resource.data.deliveryPartnerUserId &&
+            (
+              (resource.data.status == 'pending' && request.resource.data.status in ['accepted', 'cancelled']) ||
+              (resource.data.status == 'accepted' && request.resource.data.status == 'preparing') ||
+              (resource.data.status == 'preparing' && request.resource.data.status == 'ready')
+            )
+          ) ||
+          // 3. Assigned Delivery Partner: Can only update deliveryStatus & mark delivered
+          (
+            resource.data.deliveryPartnerUserId == request.auth.uid &&
+            request.resource.data.deliveryPartnerId == resource.data.deliveryPartnerId &&
+            request.resource.data.deliveryPartnerUserId == resource.data.deliveryPartnerUserId &&
+            (
+              (request.resource.data.deliveryStatus in ['picked_up', 'out_for_delivery', 'delivered']) ||
+              (request.resource.data.status == 'delivered' && resource.data.status in ['ready', 'out_for_delivery'])
+            )
+          )
+        )
+      );
+      
+      allow delete: if isSuperAdmin();
+    }
+
+    // 6. Reviews: Customers submit for their own orders; public read; admin moderates
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if isAuthenticated() && request.resource.data.customerId == request.auth.uid;
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // 7. Cook Verification Requests: Private to applicant and Super Admin
+    match /cook_verification_requests/{requestId} {
+      allow create: if isAuthenticated() && 
+                    request.resource.data.userId == request.auth.uid &&
+                    request.resource.data.status == 'pending';
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isSuperAdmin());
+      // Verification status and reviewer notes can ONLY be updated by Super Admin
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // 8. Partner Applications: Anyone can submit; only Super Admin reads/updates/approves
+    match /partner_applications/{applicationId} {
+      allow create: if true;
+      allow read, update, delete: if isSuperAdmin();
+    }
+
+    // 9. Delivery Partners: Protected Private Rider Information
+    match /delivery_partners/{partnerId} {
+      // Private data (Aadhaar, license, bank account, earnings) is ONLY readable by the rider and Super Admin
+      allow read: if isSuperAdmin() || (isAuthenticated() && resource.data.userId == request.auth.uid);
+      
+      allow create: if isAuthenticated() && (
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.earningsBalance == 0
+      ) || isSuperAdmin();
+      
+      // Rider can only update isAvailable, workingHours, and serviceArea. Cannot change approval status or earnings.
+      allow update: if isSuperAdmin() || (
+        isAuthenticated() && resource.data.userId == request.auth.uid &&
+        request.resource.data.userId == resource.data.userId &&
+        request.resource.data.status == resource.data.status &&
+        request.resource.data.earningsBalance == resource.data.earningsBalance &&
+        request.resource.data.rating == resource.data.rating &&
+        request.resource.data.totalDeliveries == resource.data.totalDeliveries &&
+        request.resource.data.aadhaarNumber == resource.data.aadhaarNumber
+      );
+      
+      allow delete: if isSuperAdmin();
+    }
+
+    // 10. Student & Homestyle Meal Plans: Public read; Super Admin manages
+    match /meal_plans/{planId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    // 11. Customer Subscriptions: Protected Financials & Schedule
+    match /customer_subscriptions/{subscriptionId} {
+      allow read: if isAuthenticated() && (resource.data.customerId == request.auth.uid || isSuperAdmin());
+      allow create: if isAuthenticated() && 
+                    request.resource.data.customerId == request.auth.uid &&
+                    request.resource.data.mealsDelivered == 0;
+      
+      // Customers can only update pause dates or address. CANNOT modify pricing, meal count, or payment status.
+      allow update: if isSuperAdmin() || (
+        isAuthenticated() && resource.data.customerId == request.auth.uid &&
+        request.resource.data.customerId == resource.data.customerId &&
+        request.resource.data.planId == resource.data.planId &&
+        request.resource.data.paidAmount == resource.data.paidAmount &&
+        request.resource.data.paymentStatus == resource.data.paymentStatus &&
+        request.resource.data.paymentMethod == resource.data.paymentMethod &&
+        request.resource.data.totalMeals == resource.data.totalMeals &&
+        request.resource.data.mealsDelivered == resource.data.mealsDelivered
+      );
+      
+      allow delete: if isSuperAdmin();
+    }
+
+    // 12. Promotions & Coupons: Public reads; Super Admin writes
+    match /promotions/{promoId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    // 13. Complaints: Private to filing customer and Super Admin
+    match /complaints/{complaintId} {
+      allow create: if isAuthenticated() && request.resource.data.customerId == request.auth.uid;
+      allow read: if isAuthenticated() && (resource.data.customerId == request.auth.uid || isSuperAdmin());
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // 14. Operating Expenses: Strictly Super Admin
+    match /operating_expenses/{expenseId} {
+      allow read, write: if isSuperAdmin();
+    }
+
+    // 15. Order Idempotency: Protected server state
+    match /order_idempotency/{idempotencyKey} {
+      allow read: if isAuthenticated() && (resource.data.customerId == request.auth.uid || isSuperAdmin());
+      allow write: if isSuperAdmin();
+    }
+
+    // 16. Coupon Redemptions: Transactional per-customer limit tracking
+    match /coupon_redemptions/{redemptionId} {
+      allow read: if isAuthenticated() && (resource.data.customerId == request.auth.uid || isSuperAdmin());
+      allow write: if isSuperAdmin();
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "CookNow - Homestyle Food Marketplace",
+  "description": "Connecting students, hostel residents, and working professionals with local verified home cooks in Nalapani Chowk, Dehradun.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

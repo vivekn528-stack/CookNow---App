@@ -1,0 +1,102 @@
+{
+  "backupMetadata": {
+    "source": "supabase/seed.sql & Supabase configuration",
+    "exportedAt": "2026-11-02T16:33:04.951Z",
+    "system": "CookNow Supabase (PostgreSQL)"
+  },
+  "platformSettings": [
+    {
+      "key": "general",
+      "value": {
+        "commissionRatePercent": 15,
+        "standardDeliveryFee": 25,
+        "freeDeliveryThreshold": 250,
+        "platformServiceFee": 5,
+        "packagingFee": 10,
+        "launchLocality": "Nalapani Chowk, Dehradun, Uttarakhand",
+        "supportPhone": "+91 94120 44556",
+        "supportEmail": "support@cooknow-dehradun.in"
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "a0000000-0000-0000-0000-000000000001",
+      "email": "admin@cooknow.in",
+      "full_name": "Dehradun Ops Admin",
+      "phone": "+91 94120 44556",
+      "role": "admin"
+    },
+    {
+      "id": "a0000000-0000-0000-0000-000000000002",
+      "email": "sunita.rawat@gmail.com",
+      "full_name": "Sunita Rawat",
+      "phone": "+91 98971 23450",
+      "role": "cook"
+    },
+    {
+      "id": "a0000000-0000-0000-0000-000000000003",
+      "email": "kamla.sharma@gmail.com",
+      "full_name": "Kamla Sharma",
+      "phone": "+91 98370 88219",
+      "role": "cook"
+    },
+    {
+      "id": "a0000000-0000-0000-0000-000000000004",
+      "email": "student.aman@upes.ac.in",
+      "full_name": "Aman Negi",
+      "phone": "+91 98765 43210",
+      "role": "customer"
+    }
+  ],
+  "cooks": [
+    {
+      "id": "c0000000-0000-0000-0000-00000001",
+      "user_id": "a0000000-0000-0000-0000-000000000002",
+      "kitchen_name": "Sunita's Pahadi Rasoi",
+      "owner_name": "Sunita Rawat",
+      "phone": "+91 98971 23450",
+      "bio": "Proud home cook from Pauri Garhwal now living in Nalapani Chowk. Cooking traditional Uttarakhand delicacies with hand-ground spices and organic millets.",
+      "address": "House 42, Near Shiv Mandir, Upper Nalapani Road",
+      "locality": "Nalapani Chowk",
+      "city": "Dehradun",
+      "state": "Uttarakhand",
+      "fssai_number": "22623001000492",
+      "is_verified": true,
+      "verification_status": "approved",
+      "rating": 4.9,
+      "review_count": 112,
+      "specialty": "Authentic Garhwali Thali & Mandua Rotis"
+    },
+    {
+      "id": "c0000000-0000-0000-0000-00000002",
+      "user_id": "a0000000-0000-0000-0000-000000000003",
+      "kitchen_name": "Aunty's Ghar Ka Khana",
+      "owner_name": "Kamla Sharma",
+      "phone": "+91 98370 88219",
+      "bio": "Serving comforting North Indian homestyle tiffins to college students and hostelers in Dehradun. Less oil, zero soda, pure motherly warmth.",
+      "address": "Lane 3, Tapovan Enclave, Near Raipur Chowk",
+      "locality": "Raipur Road",
+      "city": "Dehradun",
+      "state": "Uttarakhand",
+      "fssai_number": "22623001000811",
+      "is_verified": true,
+      "verification_status": "approved",
+      "rating": 4.8,
+      "review_count": 94,
+      "specialty": "Rajma Chawal & Homestyle Daily Tiffins"
+    }
+  ],
+  "counts": {
+    "platformSettings": 1,
+    "profiles": 4,
+    "cooks": 2,
+    "menuItems": 0,
+    "orders": 0,
+    "reviews": 0,
+    "deliveries": 0,
+    "subscriptions": 0,
+    "coupons": 0,
+    "totalPopulatedRecords": 7
+  }
+}

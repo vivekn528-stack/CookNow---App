@@ -1,0 +1,71 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Super Admin: Strictly verified email for owner
+    function isSuperAdmin() {
+      return isAuthenticated() && 
+             request.auth.token.email == 'vivekn528@gmail.com' &&
+             request.auth.token.email_verified == true;
+    }
+
+    function isApprovedImage() {
+      return request.resource.contentType.matches('image/(jpeg|png|webp|jpg)') &&
+             request.resource.size < 10 * 1024 * 1024;
+    }
+
+    function isApprovedDoc() {
+      return (
+        request.resource.contentType.matches('image/(jpeg|png|webp|jpg)') ||
+        request.resource.contentType == 'application/pdf'
+      ) && request.resource.size < 15 * 1024 * 1024;
+    }
+
+    // 1. Food and Menu Item Photography
+    // Public read; uploads strictly restricted to the verified cook owner of that kitchen or Super Admin
+    match /kitchens/{cookUserId}/menu-items/{allPaths=**} {
+      allow read: if true;
+      allow write: if isSuperAdmin() || (
+        isAuthenticated() && request.auth.uid == cookUserId && isApprovedImage()
+      );
+    }
+
+    // 2. Kitchen Branding, Avatars, and Cover Banners
+    // Public read; uploads strictly restricted to the cook owner or Super Admin
+    match /kitchens/{cookUserId}/branding/{allPaths=**} {
+      allow read: if true;
+      allow write: if isSuperAdmin() || (
+        isAuthenticated() && request.auth.uid == cookUserId && isApprovedImage()
+      );
+    }
+
+    // 3. User Avatars
+    // Public read; upload restricted to the profile owner or Super Admin
+    match /users/{userId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isSuperAdmin() || (
+        isAuthenticated() && request.auth.uid == userId && isApprovedImage()
+      );
+    }
+
+    // 4. Sensitive Verification Documents (FSSAI Certificate, Aadhaar, PAN proofs)
+    // Strictly PRIVATE: Accessible, uploaded, overwritten, and deleted ONLY by the applicant or Super Admin
+    match /verifications/{applicantId}/{allPaths=**} {
+      allow read: if isSuperAdmin() || (isAuthenticated() && request.auth.uid == applicantId);
+      allow write: if isSuperAdmin() || (
+        isAuthenticated() && request.auth.uid == applicantId && isApprovedDoc()
+      );
+    }
+
+    // 5. General Public Uploads (Marketing / Platform Assets)
+    // Public read; upload strictly restricted to Super Admin
+    match /public/{allPaths=**} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "backupMetadata": {
+    "projectId": "cooknow-9444c",
+    "firestoreDatabaseId": "ai-studio-cooknowhomestyle-7c8332e7-39bc-4862-8a92-262d83edb331",
+    "scannedAt": "2026-11-02T16:33:04.951Z",
+    "status": "pre-migration-baseline"
+  },
+  "collections": {
+    "cooks": {
+      "count": 0,
+      "error": "Missing or insufficient permissions.",
+      "documents": []
+    },
+    "menu_items": {
+      "count": 0,
+      "documents": []
+    },
+    "orders": {
+      "count": 0,
+      "error": "Missing or insufficient permissions.",
+      "documents": []
+    },
+    "reviews": {
+      "count": 0,
+      "documents": []
+    },
+    "delivery_partners": {
+      "count": 0,
+      "error": "Missing or insufficient permissions.",
+      "documents": []
+    },
+    "partner_applications": {
+      "count": 0,
+      "error": "Missing or insufficient permissions.",
+      "documents": []
+    },
+    "meal_plans": {
+      "count": 0,
+      "documents": []
+    },
+    "customer_subscriptions": {
+      "count": 0,
+      "error": "Missing or insufficient permissions.",
+      "documents": []
+    },
+    "promotions": {
+      "count": 0,
+      "documents": []
+    },
+    "complaints": {
+      "count": 0,
+      "error": "Missing or insufficient permissions.",
+      "documents": []
+    },
+    "operating_expenses": {
+      "count": 0,
+      "error": "Missing or insufficient permissions.",
+      "documents": []
+    },
+    "platform_settings": {
+      "count": 0,
+      "documents": []
+    },
+    "users": {
+      "count": 0,
+      "error": "Missing or insufficient permissions.",
+      "documents": []
+    }
+  },
+  "totalExistingDocuments": 0
+}
