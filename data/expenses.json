@@ -1,0 +1,29 @@
+[
+  {
+    "id": "exp-1",
+    "date": "2026-03-01",
+    "category": "packaging_subsidies",
+    "description": "500 biodegradable thermal meal containers subsidized for Nalapani home cooks",
+    "amount": 3200,
+    "paymentMethod": "upi",
+    "recordedBy": "Vivek Singh Negi"
+  },
+  {
+    "id": "exp-2",
+    "date": "2026-03-05",
+    "category": "ops_hygiene_inspection",
+    "description": "Water testing and physical kitchen audit kits for Dehradun home cooks",
+    "amount": 1800,
+    "paymentMethod": "bank_transfer",
+    "recordedBy": "Vivek Singh Negi"
+  },
+  {
+    "id": "exp-3",
+    "date": "2026-03-10",
+    "category": "marketing_student_camps",
+    "description": "Pamphlet distribution at UPES/DIT hostels and PG notice boards",
+    "amount": 1400,
+    "paymentMethod": "cash",
+    "recordedBy": "Vivek Singh Negi"
+  }
+]

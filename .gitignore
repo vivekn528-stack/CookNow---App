@@ -6,3 +6,13 @@ coverage/
 *.log
 .env*
 !.env.example
+.vercel/
+*.pem
+*.key
+firebase-debug.log*
+firestore-debug.log*
+service-account*.json
+serviceAccount*.json
+*credential*.json
+supabase.config.json
+backups/

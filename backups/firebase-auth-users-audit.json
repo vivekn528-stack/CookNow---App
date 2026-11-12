@@ -1,6 +1,0 @@
-{
-  "timestamp": "2026-11-02T16:31:30.954Z",
-  "projectId": "cooknow-9444c",
-  "error": "//console.developers.google.com/apis/api/identitytoolkit.googleapis.com/overview?project=465197547970 then retry. If you enabled this API recently, wait a few minutes for the action to propagate to our systems and retry.",
-  "note": "Firebase Admin SDK Auth inspection encountered credential limitation."
-}

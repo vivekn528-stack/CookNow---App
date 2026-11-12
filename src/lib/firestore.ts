@@ -446,9 +446,8 @@ export const firestoreService = {
       if (status === 'cancelled') {
         updates.cancellationReason = reason || 'Cancelled';
       }
-      if (status === 'delivered') {
-        updates.paymentStatus = 'paid';
-      }
+      // CRITICAL: Delivering an order does NOT automatically collect COD cash.
+      // Doorstep cash handover requires explicit reconciliation at Nalapani Hub.
 
       await updateDoc(orderRef, updates);
       return { success: true, error: null };
@@ -474,10 +473,61 @@ export const firestoreService = {
       if (riderName) updates.deliveryPartnerName = riderName;
       if (deliveryStatus === 'delivered') {
         updates.status = 'delivered';
-        updates.paymentStatus = 'paid';
       }
 
       await updateDoc(orderRef, updates);
+      return { success: true, error: null };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  },
+
+  async confirmCODRemittance(
+    orderId: string,
+    reconciledBy = 'Vivek Singh Negi'
+  ): Promise<{ success: boolean; error: string | null }> {
+    try {
+      const db = await getDb();
+      const orderRef = doc(db, 'orders', orderId);
+      const snap = await getDoc(orderRef);
+      const existingEvents = snap.exists() ? snap.data()?.events || [] : [];
+      const nowIso = new Date().toISOString();
+      const updates: any = {
+        paymentStatus: 'paid',
+        reconciledAt: nowIso,
+        reconciledBy,
+        updatedAt: nowIso,
+        events: [
+          ...existingEvents,
+          {
+            status: snap.exists() ? snap.data()?.status || 'delivered' : 'delivered',
+            timestamp: nowIso,
+            note: `COD cash remittance verified and reconciled at Nalapani Hub by ${reconciledBy}`,
+          },
+        ],
+      };
+      await updateDoc(orderRef, updates);
+      return { success: true, error: null };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  },
+
+  async reverseOperatingExpense(
+    expenseId: string,
+    reason = 'Owner financial correction',
+    reversedBy = 'Vivek Singh Negi'
+  ): Promise<{ success: boolean; error: string | null }> {
+    try {
+      const db = await getDb();
+      const expRef = doc(db, 'operating_expenses', expenseId);
+      const nowIso = new Date().toISOString();
+      await updateDoc(expRef, {
+        isReversed: true,
+        reversedAt: nowIso,
+        reversedBy,
+        reversalReason: reason,
+      });
       return { success: true, error: null };
     } catch (err: any) {
       return { success: false, error: err.message };
@@ -951,6 +1001,45 @@ export const firestoreService = {
         amount: Number(expense.amount),
       };
       await setDoc(doc(db, 'operating_expenses', id), payload);
+      return { data: payload, error: null, fromLiveBackend: true };
+    } catch (err: any) {
+      return { data: null, error: err.message, fromLiveBackend: false };
+    }
+  },
+
+  // =========================================================================
+  // Settlements (Cook & Rider Payouts)
+  // =========================================================================
+  async fetchSettlements(): Promise<FirestoreOperationResult<any[]>> {
+    try {
+      const db = await getDb();
+      const snap = await getDocs(query(collection(db, 'settlements'), orderBy('settledAt', 'desc')));
+      const settlements = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      return { data: settlements, error: null, fromLiveBackend: true };
+    } catch (err: any) {
+      return { data: null, error: err.message, fromLiveBackend: false };
+    }
+  },
+
+  async recordSettlement(settlement: {
+    id?: string;
+    targetType: 'cook' | 'rider';
+    targetId: string;
+    targetName: string;
+    amount: number;
+    referenceNumber: string;
+    settledBy?: string;
+  }): Promise<FirestoreOperationResult<any>> {
+    try {
+      const db = await getDb();
+      const id = settlement.id || `settle-${Date.now()}`;
+      const payload = {
+        ...settlement,
+        id,
+        settledAt: new Date().toISOString(),
+        settledBy: settlement.settledBy || 'Vivek Singh Negi (Founder & Owner)',
+      };
+      await setDoc(doc(db, 'settlements', id), payload);
       return { data: payload, error: null, fromLiveBackend: true };
     } catch (err: any) {
       return { data: null, error: err.message, fromLiveBackend: false };

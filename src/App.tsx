@@ -658,6 +658,89 @@ export default function App() {
     }
   };
 
+  const handleConfirmCODRemittance = async (orderId: string) => {
+    const now = new Date().toISOString();
+    setOrders((prev) =>
+      prev.map((ord) => {
+        if (ord.id === orderId) {
+          return {
+            ...ord,
+            paymentStatus: 'paid',
+            reconciledAt: now,
+            reconciledBy: 'Vivek Singh Negi (Founder & Owner)',
+            events: [
+              ...ord.events,
+              {
+                status: ord.status,
+                timestamp: now,
+                note: 'COD cash remittance confirmed and reconciled at Nalapani Hub by Vivek Singh Negi',
+              },
+            ],
+            updatedAt: now,
+          };
+        }
+        return ord;
+      })
+    );
+
+    try {
+      const auth = getFirebaseAuth();
+      const token = await auth?.currentUser?.getIdToken();
+      if (token) {
+        await fetch(`/api/orders/${orderId}/confirm-cod`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+        });
+      }
+    } catch {
+      // Non-fatal
+    }
+
+    await firestoreService.confirmCODRemittance(orderId, 'Vivek Singh Negi');
+    showToast(`Order #${orderId} COD cash remittance confirmed & reconciled!`);
+  };
+
+  const handleReverseExpense = async (expenseId: string, reason = 'Owner financial correction') => {
+    const now = new Date().toISOString();
+    setExpenses((prev) =>
+      prev.map((e) =>
+        e.id === expenseId
+          ? {
+              ...e,
+              isReversed: true,
+              reversedAt: now,
+              reversedBy: 'Vivek Singh Negi',
+              reversalReason: reason,
+            }
+          : e
+      )
+    );
+    StorageManager.reverseOperatingExpense(expenseId, reason);
+
+    try {
+      const auth = getFirebaseAuth();
+      const token = await auth?.currentUser?.getIdToken();
+      if (token) {
+        await fetch(`/api/owner/expenses/${expenseId}/reverse`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ reason }),
+        });
+      }
+    } catch {
+      // Non-fatal
+    }
+
+    await firestoreService.reverseOperatingExpense(expenseId, reason);
+    showToast('Operating expense reversed with immutable audit log.');
+  };
+
   const handleUpdateOrderStatus = async (orderId: string, nextStatus: OrderStatus, reason?: string) => {
     const targetOrder = orders.find((o) => o.id === orderId);
     if (!targetOrder) return;
@@ -678,7 +761,7 @@ export default function App() {
         : nextStatus === 'out_for_delivery'
         ? 'Dispatched with local delivery partner to Nalapani Chowk.'
         : nextStatus === 'delivered'
-        ? 'Successfully delivered to customer. Payment collected.'
+        ? 'Successfully delivered to customer. COD payment pending hub remittance.'
         : reason || 'Order status updated.';
 
     setOrders((prev) =>
@@ -688,7 +771,7 @@ export default function App() {
             ...ord,
             status: nextStatus,
             cancellationReason: nextStatus === 'cancelled' ? reason : ord.cancellationReason,
-            paymentStatus: nextStatus === 'delivered' ? 'paid' : ord.paymentStatus,
+            paymentStatus: ord.paymentStatus,
             events: [
               ...ord.events,
               {
@@ -734,7 +817,7 @@ export default function App() {
             deliveryPartnerId: partnerId,
             deliveryPartnerName: partnerName,
             deliveryStatus: status === 'delivered' ? 'delivered' : 'out_for_delivery',
-            paymentStatus: status === 'delivered' ? 'paid' : ord.paymentStatus,
+            paymentStatus: ord.paymentStatus,
             events: [
               ...ord.events,
               {
@@ -1615,9 +1698,13 @@ export default function App() {
             }}
             onAddExpense={async (exp) => {
               setExpenses((prev) => [exp, ...prev]);
+              StorageManager.saveOperatingExpenses([exp, ...expenses]);
               await firestoreService.insertOperatingExpense(exp);
               showToast(`Recorded expense: ₹${exp.amount} in Cloud Firestore`);
             }}
+            onDeleteExpense={handleReverseExpense}
+            onReverseExpense={handleReverseExpense}
+            onConfirmCODRemittance={handleConfirmCODRemittance}
             onToggleMenuItemAvailability={async (itemId) => {
               const target = menuItems.find((it) => it.id === itemId);
               const nextAvail = target ? !target.isAvailable : false;

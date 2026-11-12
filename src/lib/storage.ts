@@ -1072,6 +1072,25 @@ export const StorageManager = {
     localStorage.setItem(STORAGE_KEYS.OPERATING_EXPENSES, JSON.stringify(expenses));
   },
 
+  reverseOperatingExpense(id: string, reason = 'Owner financial correction'): void {
+    const list = this.getOperatingExpenses().map((e) =>
+      e.id === id
+        ? {
+            ...e,
+            isReversed: true,
+            reversedAt: new Date().toISOString(),
+            reversedBy: OWNER_PROFILE.fullName,
+            reversalReason: reason,
+          }
+        : e
+    );
+    this.saveOperatingExpenses(list);
+  },
+
+  deleteOperatingExpense(id: string): void {
+    this.reverseOperatingExpense(id, 'Owner administrative reversal');
+  },
+
   getSettings(): PlatformSettings {
     const raw = localStorage.getItem(STORAGE_KEYS.SETTINGS);
     if (!raw) {

@@ -276,5 +276,15 @@ service cloud.firestore {
       allow read: if isAuthenticated() && (resource.data.customerId == request.auth.uid || isSuperAdmin());
       allow write: if isSuperAdmin();
     }
+
+    // 17. Settlements (Cook & Rider payouts): Strictly Super Admin
+    match /settlements/{settlementId} {
+      allow read, write: if isSuperAdmin();
+    }
+
+    // 18. Audit Logs: Strictly Super Admin
+    match /audit_logs/{logId} {
+      allow read, write: if isSuperAdmin();
+    }
   }
 }

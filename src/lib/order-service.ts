@@ -1,5 +1,4 @@
-import { httpsCallable } from 'firebase/functions';
-import { getFirebaseFunctions, getFirebaseAuth } from './firebase';
+import { getFirebaseAuth } from './firebase';
 import type { Order, CartItem, PaymentMethod } from '../types';
 
 export interface PlaceOrderPayload {
@@ -33,9 +32,10 @@ export interface PlaceOrderResponse {
  * Client Order Placement Service
  *
  * Strict Server-Authoritative Architecture:
- * - Invokes the secure Firebase Callable Cloud Function (placeOrder).
+ * - Invokes the secure Express backend (/api/orders/place) with verified Firebase ID token.
  * - Direct Web SDK client-side order creation is completely disabled.
- * - If the Cloud Function is unavailable or rejects the request, a clear error is returned
+ * - Server cryptographically validates prices, quantities, cook verification, coupon limits, and idempotency.
+ * - If the server rejects the request, a clear error is returned
  *   and the user's cart, coupon, and checkout details are safely preserved without data loss.
  */
 export async function placeCustomerOrder(
@@ -54,29 +54,34 @@ export async function placeCustomerOrder(
     };
   }
 
-  const functions = getFirebaseFunctions();
-
-  if (!functions) {
+  let idToken = '';
+  try {
+    idToken = await currentUser.getIdToken();
+  } catch (err: any) {
     return {
       success: false,
       order: null,
-      error:
-        'Firebase Cloud Functions service is uninitialized. The secure order placement backend is unavailable. Your cart and checkout details have been safely preserved.',
+      error: 'Failed to retrieve authentication token. Please sign in again.',
       fromServerFunction: false,
     };
   }
 
   try {
-    const placeOrderCallable = httpsCallable<PlaceOrderPayload, { success: boolean; order: Order }>(
-      functions,
-      'placeOrder'
-    );
+    const res = await fetch('/api/orders/place', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+      body: JSON.stringify(payload),
+    });
 
-    const result = await placeOrderCallable(payload);
-    if (result.data?.success && result.data.order) {
+    const data = await res.json().catch(() => null);
+
+    if (res.ok && data?.success && data.order) {
       return {
         success: true,
-        order: result.data.order,
+        order: data.order,
         error: null,
         fromServerFunction: true,
       };
@@ -85,33 +90,51 @@ export async function placeCustomerOrder(
     return {
       success: false,
       order: null,
-      error: 'Order could not be confirmed by the server backend. Please retry.',
+      error: data?.error || 'Order could not be confirmed by the server backend. Please retry.',
       fromServerFunction: true,
     };
   } catch (err: any) {
-    const isNotDeployed =
-      err?.code === 'functions/not-found' ||
-      err?.code === 'not-found' ||
-      err?.message?.includes('not found') ||
-      err?.message?.includes('404');
-
-    if (isNotDeployed) {
-      return {
-        success: false,
-        order: null,
-        error:
-          'The server-authoritative order backend (Cloud Functions "placeOrder") is currently undergoing deployment or unavailable on project cooknow-9444c. Direct Web SDK order creation is disabled for financial safety. Your cart items, coupon, and delivery address are completely preserved.',
-        fromServerFunction: true,
-      };
-    }
-
-    // Genuine business, validation, or authentication failure from the Cloud Function
     return {
       success: false,
       order: null,
-      error: err?.message || 'Server rejected order request. Please review your order details.',
+      error: err?.message || 'Network error communicating with order backend.',
       fromServerFunction: true,
     };
+  }
+}
+
+/**
+ * Fetch authenticated customer's own orders from server-authoritative backend
+ */
+export async function fetchCustomerOrders(): Promise<{
+  success: boolean;
+  orders: Order[];
+  error?: string;
+}> {
+  const auth = getFirebaseAuth();
+  const currentUser = auth?.currentUser;
+
+  if (!currentUser) {
+    return { success: false, orders: [] };
+  }
+
+  try {
+    const idToken = await currentUser.getIdToken();
+    const res = await fetch('/api/orders/my-orders', {
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+      },
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      return { success: false, orders: [], error: err.error || 'Failed to fetch orders' };
+    }
+
+    const data = await res.json();
+    return { success: true, orders: data.orders || [] };
+  } catch (err: any) {
+    return { success: false, orders: [], error: err.message };
   }
 }
 

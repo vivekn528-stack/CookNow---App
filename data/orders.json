@@ -1,0 +1,165 @@
+[
+  {
+    "id": "ORD-9821",
+    "orderCode": "ORD-9821",
+    "customerId": "cust-1",
+    "customerName": "Aman Negi",
+    "customerPhone": "9876543210",
+    "cookId": "cook-1",
+    "kitchenName": "Sunita's Pahadi Rasoi",
+    "status": "out_for_delivery",
+    "items": [
+      {
+        "id": "oi-1",
+        "orderId": "ORD-9821",
+        "menuItemId": "meal-thali-full",
+        "itemName": "Special Garhwali Homestyle Thali",
+        "unitPrice": 160,
+        "quantity": 1,
+        "subtotal": 160,
+        "dietaryType": "pure_veg"
+      },
+      {
+        "id": "oi-2",
+        "orderId": "ORD-9821",
+        "menuItemId": "meal-gahat-dal",
+        "itemName": "Garhwali Kulath Ki Dal & Rice",
+        "unitPrice": 80,
+        "quantity": 1,
+        "subtotal": 80,
+        "dietaryType": "pure_veg"
+      }
+    ],
+    "itemsSubtotal": 240,
+    "deliveryFee": 25,
+    "platformFee": 5,
+    "packagingFee": 10,
+    "discount": 24,
+    "discountCode": "STUDENT10",
+    "discountFunding": "cooknow_funded",
+    "finalPayableAmount": 256,
+    "platformCommission": 36,
+    "cookEarnings": 204,
+    "paymentMethod": "cod",
+    "paymentStatus": "pending",
+    "deliveryPartnerId": "dp-1",
+    "deliveryPartnerName": "Suresh Semwal",
+    "deliveryStatus": "out_for_delivery",
+    "deliveryAddress": {
+      "fullName": "Aman Negi",
+      "phone": "9876543210",
+      "locality": "Nalapani Chowk",
+      "addressLine": "Room 302, Shivalik Boys PG, Main Raipur Road",
+      "landmark": "Near SBI ATM & Nalapani Chowk",
+      "hostelOrPgName": "Shivalik Boys PG"
+    },
+    "deliveryInstructions": "Please call before entering the gate.",
+    "events": [
+      {
+        "status": "pending",
+        "timestamp": "2026-03-15T12:30:00Z",
+        "note": "Order placed via Cash on Delivery."
+      },
+      {
+        "status": "accepted",
+        "timestamp": "2026-03-15T12:33:00Z",
+        "note": "Order accepted by Sunita Rawat."
+      },
+      {
+        "status": "preparing",
+        "timestamp": "2026-03-15T12:35:00Z",
+        "note": "Fresh meal being cooked."
+      },
+      {
+        "status": "ready",
+        "timestamp": "2026-03-15T12:55:00Z",
+        "note": "Packed in thermal container."
+      },
+      {
+        "status": "out_for_delivery",
+        "timestamp": "2026-03-15T13:00:00Z",
+        "note": "Dispatched with Suresh Semwal."
+      }
+    ],
+    "createdAt": "2026-03-15T12:30:00Z",
+    "updatedAt": "2026-03-15T13:00:00Z"
+  },
+  {
+    "id": "ORD-9755",
+    "orderCode": "ORD-9755",
+    "customerId": "cust-2",
+    "customerName": "Priya Joshi",
+    "customerPhone": "9812345678",
+    "cookId": "cook-2",
+    "kitchenName": "Aunty's Ghar Ka Khana",
+    "status": "delivered",
+    "items": [
+      {
+        "id": "oi-3",
+        "orderId": "ORD-9755",
+        "menuItemId": "meal-rajma-chawal",
+        "itemName": "Ghar Ke Rajma Chawal Bowl",
+        "unitPrice": 120,
+        "quantity": 2,
+        "subtotal": 240,
+        "dietaryType": "pure_veg"
+      }
+    ],
+    "itemsSubtotal": 240,
+    "deliveryFee": 25,
+    "platformFee": 5,
+    "packagingFee": 10,
+    "discount": 0,
+    "finalPayableAmount": 280,
+    "platformCommission": 36,
+    "cookEarnings": 204,
+    "paymentMethod": "cod",
+    "paymentStatus": "paid",
+    "deliveryPartnerId": "dp-2",
+    "deliveryPartnerName": "Deepak Panwar",
+    "deliveryStatus": "delivered",
+    "deliveryAddress": {
+      "fullName": "Priya Joshi",
+      "phone": "9812345678",
+      "locality": "Nalapani Chowk",
+      "addressLine": "Flat 12B, Devbhoomi Girls Hostel",
+      "landmark": "Behind Nalapani Post Office",
+      "hostelOrPgName": "Devbhoomi Girls Hostel"
+    },
+    "deliveryInstructions": "Leave with hostel warden if busy.",
+    "events": [
+      {
+        "status": "pending",
+        "timestamp": "2026-03-14T19:00:00Z",
+        "note": "Order placed."
+      },
+      {
+        "status": "accepted",
+        "timestamp": "2026-03-14T19:02:00Z",
+        "note": "Accepted by cook."
+      },
+      {
+        "status": "preparing",
+        "timestamp": "2026-03-14T19:05:00Z",
+        "note": "Meal prepared."
+      },
+      {
+        "status": "ready",
+        "timestamp": "2026-03-14T19:25:00Z",
+        "note": "Packed in thermal container."
+      },
+      {
+        "status": "out_for_delivery",
+        "timestamp": "2026-03-14T19:30:00Z",
+        "note": "Dispatched with Deepak Panwar."
+      },
+      {
+        "status": "delivered",
+        "timestamp": "2026-03-14T19:48:00Z",
+        "note": "Delivered. Cash ₹280 collected."
+      }
+    ],
+    "createdAt": "2026-03-14T19:00:00Z",
+    "updatedAt": "2026-03-14T19:48:00Z"
+  }
+]

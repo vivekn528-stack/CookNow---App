@@ -138,6 +138,8 @@ export interface Order {
   };
   deliveryInstructions?: string;
   cancellationReason?: string;
+  reconciledAt?: string;
+  reconciledBy?: string;
   events: OrderEvent[];
   createdAt: string;
   updatedAt: string;
@@ -317,20 +319,31 @@ export interface Complaint {
   resolvedAt?: string;
 }
 
+export type ExpenseCategory =
+  | 'logistics_partner_payout'
+  | 'packaging_subsidies'
+  | 'marketing_student_camps'
+  | 'ops_hygiene_inspection'
+  | 'software_platform'
+  | 'salaries'
+  | 'refunds'
+  | 'payment_gateway_fees'
+  | 'other';
+
 export interface OperatingExpense {
   id: string;
   date: string;
-  category:
-    | 'logistics_partner_payout'
-    | 'packaging_subsidies'
-    | 'marketing_student_camps'
-    | 'ops_hygiene_inspection'
-    | 'software_platform'
-    | 'payment_gateway_fees'
-    | 'other';
+  category: ExpenseCategory;
   description: string;
   amount: number;
   recordedBy: string;
+  paymentMethod?: 'bank_transfer' | 'upi' | 'cash' | 'credit_card' | 'other';
+  receiptUrl?: string;
+  createdAt?: string;
+  isReversed?: boolean;
+  reversedAt?: string;
+  reversedBy?: string;
+  reversalReason?: string;
 }
 
 export interface PlatformSettings {
