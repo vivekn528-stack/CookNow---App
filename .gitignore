@@ -16,3 +16,8 @@ serviceAccount*.json
 *credential*.json
 supabase.config.json
 backups/
+# Local runtime / migration data — never commit
+/data/
+/backups/
+*.service-account.json
+firebase-adminsdk-*.json
