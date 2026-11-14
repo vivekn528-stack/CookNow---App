@@ -2861,6 +2861,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {activeTab === 'customer-care' && (
         <CustomerCareTab
           orders={orders}
+          deliveryPartners={deliveryPartners}
           onInspectOrder={(order) => setSelectedOrder(order)}
           onStatsChange={setSupportStats}
         />

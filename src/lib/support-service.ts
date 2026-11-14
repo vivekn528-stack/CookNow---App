@@ -54,6 +54,60 @@ export interface TicketDetailPayload {
   auditLogs?: any[];
 }
 
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+function handleFirestoreError(
+  error: unknown,
+  operationType: OperationType,
+  path: string | null
+): never {
+  const auth = getFirebaseAuth();
+  const user = auth?.currentUser;
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    operationType,
+    path,
+    authInfo: {
+      userId: user?.uid || null,
+      email: user?.email || null,
+      emailVerified: Boolean(user?.emailVerified),
+      isAnonymous: Boolean(user?.isAnonymous),
+      tenantId: user?.tenantId || null,
+      providerInfo:
+        user?.providerData?.map((p) => ({
+          providerId: p.providerId,
+          email: p.email,
+        })) || [],
+    },
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
 function logFirestorePermissionContext(
   operationType: 'get' | 'list' | 'create' | 'update' | 'delete' | 'write',
   path: string,
@@ -61,7 +115,7 @@ function logFirestorePermissionContext(
 ) {
   const auth = getFirebaseAuth();
   const user = auth?.currentUser;
-  console.error('[SupportFirestoreError]', {
+  console.error('Firestore Error: ', JSON.stringify({
     error: error instanceof Error ? error.message : String(error),
     operationType,
     path,
@@ -70,7 +124,7 @@ function logFirestorePermissionContext(
       email: user?.email || null,
       emailVerified: Boolean(user?.emailVerified),
     },
-  });
+  }));
 }
 
 async function getAuthenticatedToken(): Promise<{ uid: string; token: string }> {
@@ -383,8 +437,9 @@ export const supportService = {
       };
 
       // In local dev without Admin credentials, enrich from client Firestore if missing or stale
-      const db = await getClientDb();
-      if (db) {
+      if (data.adminPersisted === false) {
+        const db = await getClientDb();
+        if (db) {
         try {
           const [tSnap, mSnap] = await Promise.all([
             getDoc(doc(db, 'support_tickets', ticketId)),
@@ -441,8 +496,9 @@ export const supportService = {
               }
             }
           }
-        } catch (err) {
-          logFirestorePermissionContext('get', `support_tickets/${ticketId}`, err);
+          } catch (err) {
+            logFirestorePermissionContext('get', `support_tickets/${ticketId}`, err);
+          }
         }
       }
 
@@ -521,17 +577,32 @@ export const supportService = {
         }
       );
 
-      // Sync to Firestore if serverless Admin SDK isn't present
-      const db = await getClientDb();
-      if (db) {
-        const msg = data.message as SupportMessage;
-        const tkt = data.ticket as SupportTicket;
-        await setDoc(doc(db, 'support_tickets', ticketId, 'messages', msg.id), msg).catch(
-          () => {}
-        );
-        await setDoc(doc(db, 'support_tickets', ticketId), tkt, { merge: true }).catch(
-          () => {}
-        );
+      // Only mirror via client Firestore SDK when server Admin SDK credentials are absent
+      if (data.adminPersisted === false) {
+        const db = await getClientDb();
+        if (db) {
+          const msg = data.message as SupportMessage;
+          const tkt = data.ticket as SupportTicket;
+          try {
+            await setDoc(doc(db, 'support_tickets', ticketId, 'messages', msg.id), msg);
+            if (options?.senderRole === 'owner') {
+              await setDoc(doc(db, 'support_tickets', ticketId), tkt, { merge: true });
+            } else {
+              await updateDoc(doc(db, 'support_tickets', ticketId), {
+                status: tkt.status,
+                unreadForOwner: tkt.unreadForOwner,
+                unreadForCustomer: tkt.unreadForCustomer,
+                lastMessagePreview: tkt.lastMessagePreview,
+                lastMessageAt: tkt.lastMessageAt,
+                messageCount: tkt.messageCount,
+                history: tkt.history,
+                updatedAt: tkt.updatedAt,
+              });
+            }
+          } catch (fsErr) {
+            handleFirestoreError(fsErr, OperationType.WRITE, `support_tickets/${ticketId}`);
+          }
+        }
       }
 
       return { message: data.message, ticket: data.ticket };
@@ -581,19 +652,24 @@ export const supportService = {
           t.status = 'In Progress';
         }
 
-        await setDoc(doc(db, 'support_tickets', ticketId, 'messages', msg.id), msg);
-        if (isOwner) {
-          await setDoc(doc(db, 'support_tickets', ticketId), t, { merge: true });
-        } else {
-          await updateDoc(doc(db, 'support_tickets', ticketId), {
-            unreadForOwner: t.unreadForOwner,
-            unreadForCustomer: t.unreadForCustomer,
-            lastMessagePreview: t.lastMessagePreview,
-            lastMessageAt: t.lastMessageAt,
-            messageCount: t.messageCount,
-            history: t.history,
-            updatedAt: t.updatedAt,
-          });
+        try {
+          await setDoc(doc(db, 'support_tickets', ticketId, 'messages', msg.id), msg);
+          if (isOwner) {
+            await setDoc(doc(db, 'support_tickets', ticketId), t, { merge: true });
+          } else {
+            await updateDoc(doc(db, 'support_tickets', ticketId), {
+              status: t.status,
+              unreadForOwner: t.unreadForOwner,
+              unreadForCustomer: t.unreadForCustomer,
+              lastMessagePreview: t.lastMessagePreview,
+              lastMessageAt: t.lastMessageAt,
+              messageCount: t.messageCount,
+              history: t.history,
+              updatedAt: t.updatedAt,
+            });
+          }
+        } catch (fsErr) {
+          handleFirestoreError(fsErr, OperationType.WRITE, `support_tickets/${ticketId}`);
         }
         return { message: msg, ticket: t };
       }
@@ -617,16 +693,18 @@ export const supportService = {
         }
       );
 
-      const db = await getClientDb();
-      if (db) {
-        const note = data.note as SupportInternalNote;
-        const tkt = data.ticket as SupportTicket;
-        await setDoc(doc(db, 'support_tickets', ticketId, 'internal_notes', note.id), note).catch(
-          () => {}
-        );
-        await setDoc(doc(db, 'support_tickets', ticketId), tkt, { merge: true }).catch(
-          () => {}
-        );
+      if (data.adminPersisted === false) {
+        const db = await getClientDb();
+        if (db) {
+          const note = data.note as SupportInternalNote;
+          const tkt = data.ticket as SupportTicket;
+          try {
+            await setDoc(doc(db, 'support_tickets', ticketId, 'internal_notes', note.id), note);
+            await setDoc(doc(db, 'support_tickets', ticketId), tkt, { merge: true });
+          } catch (fsErr) {
+            handleFirestoreError(fsErr, OperationType.WRITE, `support_tickets/${ticketId}/internal_notes`);
+          }
+        }
       }
 
       return { note: data.note, ticket: data.ticket };
@@ -675,11 +753,15 @@ export const supportService = {
         body: JSON.stringify(updates),
       });
       const updated = data.ticket as SupportTicket;
-      const db = await getClientDb();
-      if (db) {
-        await setDoc(doc(db, 'support_tickets', ticketId), updated, { merge: true }).catch(
-          () => {}
-        );
+      if (data.adminPersisted === false) {
+        const db = await getClientDb();
+        if (db) {
+          try {
+            await setDoc(doc(db, 'support_tickets', ticketId), updated, { merge: true });
+          } catch (fsErr) {
+            handleFirestoreError(fsErr, OperationType.WRITE, `support_tickets/${ticketId}`);
+          }
+        }
       }
       return updated;
     } catch (err: any) {
@@ -738,18 +820,22 @@ export const supportService = {
           next.unreadForOwner = false;
         }
         next.history = [...(next.history || []), ...addedEvents];
-        await setDoc(doc(db, 'support_tickets', ticketId), next, { merge: true });
-        await setDoc(doc(db, 'audit_logs', `aud_tkt_${ticketId}_${Date.now()}`), {
-          id: `aud_tkt_${ticketId}_${Date.now()}`,
-          action: 'SUPPORT_TICKET_UPDATED',
-          targetType: 'support_ticket',
-          targetId: ticketId,
-          actorUid: uid,
-          actorEmail: 'vivekn528@gmail.com',
-          actorName: 'Vivek Singh Negi',
-          details: addedEvents.map((e) => e.details).join(' '),
-          createdAt: nowIso,
-        }).catch(() => {});
+        try {
+          await setDoc(doc(db, 'support_tickets', ticketId), next, { merge: true });
+          await setDoc(doc(db, 'audit_logs', `aud_tkt_${ticketId}_${Date.now()}`), {
+            id: `aud_tkt_${ticketId}_${Date.now()}`,
+            action: 'SUPPORT_TICKET_UPDATED',
+            targetType: 'support_ticket',
+            targetId: ticketId,
+            actorUid: uid,
+            actorEmail: 'vivekn528@gmail.com',
+            actorName: 'Vivek Singh Negi',
+            details: addedEvents.map((e) => e.details).join(' '),
+            createdAt: nowIso,
+          });
+        } catch (fsErr) {
+          handleFirestoreError(fsErr, OperationType.WRITE, `support_tickets/${ticketId}`);
+        }
         return next;
       }
       throw err;
@@ -778,11 +864,15 @@ export const supportService = {
         }
       );
       const updated = data.ticket as SupportTicket;
-      const db = await getClientDb();
-      if (db) {
-        await setDoc(doc(db, 'support_tickets', ticketId), updated, { merge: true }).catch(
-          () => {}
-        );
+      if (data.adminPersisted === false) {
+        const db = await getClientDb();
+        if (db) {
+          try {
+            await setDoc(doc(db, 'support_tickets', ticketId), updated, { merge: true });
+          } catch (fsErr) {
+            handleFirestoreError(fsErr, OperationType.WRITE, `support_tickets/${ticketId}`);
+          }
+        }
       }
       return updated;
     } catch (err: any) {
@@ -825,18 +915,22 @@ export const supportService = {
             },
           ],
         };
-        await setDoc(doc(db, 'support_tickets', ticketId), next, { merge: true });
-        await setDoc(doc(db, 'audit_logs', `aud_ref_${ticketId}_${Date.now()}`), {
-          id: `aud_ref_${ticketId}_${Date.now()}`,
-          action: `SUPPORT_REFUND_${payload.status.toUpperCase()}`,
-          targetType: 'support_ticket',
-          targetId: ticketId,
-          actorUid: uid,
-          actorEmail: 'vivekn528@gmail.com',
-          actorName: 'Vivek Singh Negi',
-          details: `Refund ${payload.status} · Reason: ${payload.reason.trim()}`,
-          createdAt: nowIso,
-        }).catch(() => {});
+        try {
+          await setDoc(doc(db, 'support_tickets', ticketId), next, { merge: true });
+          await setDoc(doc(db, 'audit_logs', `aud_ref_${ticketId}_${Date.now()}`), {
+            id: `aud_ref_${ticketId}_${Date.now()}`,
+            action: `SUPPORT_REFUND_${payload.status.toUpperCase()}`,
+            targetType: 'support_ticket',
+            targetId: ticketId,
+            actorUid: uid,
+            actorEmail: 'vivekn528@gmail.com',
+            actorName: 'Vivek Singh Negi',
+            details: `Refund ${payload.status} · Reason: ${payload.reason.trim()}`,
+            createdAt: nowIso,
+          });
+        } catch (fsErr) {
+          handleFirestoreError(fsErr, OperationType.WRITE, `support_tickets/${ticketId}`);
+        }
         return next;
       }
       throw err;
@@ -860,15 +954,21 @@ export const supportService = {
         }
       );
       const updated = data.ticket as SupportTicket;
-      const db = await getClientDb();
-      if (db) {
-        await updateDoc(doc(db, 'support_tickets', ticketId), {
-          satisfactionRating: updated.satisfactionRating,
-          satisfactionFeedback: updated.satisfactionFeedback,
-          ratedAt: updated.ratedAt,
-          history: updated.history,
-          updatedAt: updated.updatedAt,
-        }).catch(() => {});
+      if (data.adminPersisted === false) {
+        const db = await getClientDb();
+        if (db) {
+          try {
+            await updateDoc(doc(db, 'support_tickets', ticketId), {
+              satisfactionRating: updated.satisfactionRating,
+              satisfactionFeedback: updated.satisfactionFeedback,
+              ratedAt: updated.ratedAt,
+              history: updated.history,
+              updatedAt: updated.updatedAt,
+            });
+          } catch (fsErr) {
+            handleFirestoreError(fsErr, OperationType.UPDATE, `support_tickets/${ticketId}`);
+          }
+        }
       }
       return updated;
     } catch (err: any) {

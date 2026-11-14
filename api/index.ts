@@ -3054,6 +3054,7 @@ router.get('/support/tickets/:ticketId', asyncHandler(async (req: Request, res: 
       success: true,
       ticket,
       messages,
+      adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
     });
   }
 
@@ -3089,6 +3090,7 @@ router.get('/support/tickets/:ticketId', asyncHandler(async (req: Request, res: 
     internalNotes,
     linkedOrder,
     auditLogs,
+    adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
   });
 }));
 
@@ -3191,10 +3193,25 @@ router.post('/support/tickets/:ticketId/reply', asyncHandler(async (req: Request
 
   await saveSupportTicketRecord(ticket);
 
+  if (isOwner) {
+    await persistSupportAuditLog({
+      id: `aud_reply_${msg.id}`,
+      action: 'SUPPORT_OWNER_REPLIED',
+      targetType: 'support_ticket',
+      targetId: ticketId,
+      actorUid: verifiedUser.uid,
+      actorEmail: verifiedUser.email,
+      actorName: senderName,
+      details: `Owner sent public reply on ticket ${ticketId} (status: ${ticket.status}).`,
+      createdAt: nowIso,
+    });
+  }
+
   return res.json({
     success: true,
     message: msg,
     ticket,
+    adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
     channelNote:
       'Reply saved to Firestore support thread. External SMS, WhatsApp, Email, and Push notifications are not integrated.',
   });
@@ -3262,6 +3279,7 @@ router.post('/support/tickets/:ticketId/internal-notes', asyncHandler(async (req
     success: true,
     note,
     ticket,
+    adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
   });
 }));
 
@@ -3392,6 +3410,7 @@ router.patch('/support/tickets/:ticketId', asyncHandler(async (req: Request, res
   return res.json({
     success: true,
     ticket,
+    adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
   });
 }));
 
@@ -3467,6 +3486,13 @@ router.post('/support/tickets/:ticketId/refund', asyncHandler(async (req: Reques
     return res.status(400).json({
       success: false,
       error: `Refund amount ₹${numericAmount} cannot exceed linked order total ₹${maxOrderAmount}.`,
+    });
+  }
+
+  if (maxOrderAmount === null && numericAmount > 10000) {
+    return res.status(400).json({
+      success: false,
+      error: 'General support refunds without a linked order are capped at ₹10,000 per ticket.',
     });
   }
 
@@ -3552,6 +3578,7 @@ router.post('/support/tickets/:ticketId/refund', asyncHandler(async (req: Reques
     success: true,
     ticket,
     refund: updatedRefund,
+    adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
   });
 }));
 
@@ -3612,9 +3639,22 @@ router.post('/support/tickets/:ticketId/csat', asyncHandler(async (req: Request,
 
   await saveSupportTicketRecord(ticket);
 
+  await persistSupportAuditLog({
+    id: `aud_csat_${ticketId}_${Date.now()}`,
+    action: 'SUPPORT_CSAT_SUBMITTED',
+    targetType: 'support_ticket',
+    targetId: ticketId,
+    actorUid: verifiedUser.uid,
+    actorEmail: verifiedUser.email,
+    actorName: ticket.customerName || 'Customer',
+    details: `Customer submitted ${numericRating}/5 CSAT rating on ticket ${ticketId}.`,
+    createdAt: nowIso,
+  });
+
   return res.json({
     success: true,
     ticket,
+    adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
   });
 }));
 

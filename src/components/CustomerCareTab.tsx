@@ -23,6 +23,7 @@ import {
   ShieldAlert,
 } from 'lucide-react';
 import {
+  DeliveryPartner,
   Order,
   SUPPORT_TICKET_CATEGORIES,
   SUPPORT_TICKET_PRIORITIES,
@@ -39,6 +40,7 @@ import { supportService, SupportTicketFilter } from '../lib/support-service';
 
 interface CustomerCareTabProps {
   orders: Order[];
+  deliveryPartners?: DeliveryPartner[];
   onInspectOrder: (order: Order) => void;
   onNotify?: (message: string) => void;
   onStatsChange?: (stats: SupportTicketStats) => void;
@@ -135,6 +137,7 @@ function getRefundBadgeClass(status: SupportRefundStatus): string {
 
 export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
   orders,
+  deliveryPartners = [],
   onInspectOrder,
   onNotify,
   onStatsChange,
@@ -237,7 +240,7 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
         // Pre-populate refund inputs safely from ticket record
         const rf = detail.ticket.refund;
         if (rf && rf.status !== 'None') {
-          setRefundStatusInput(rf.status);
+          setRefundStatusInput(rf.status === 'Requested' ? 'Approved' : rf.status);
           setRefundAmountInput(rf.amount > 0 ? String(rf.amount) : '');
           setRefundReasonInput(rf.reason || '');
           setRefundRefInput(rf.settlementReference || '');
@@ -250,17 +253,34 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
           setRefundConfirmedCheck(false);
         }
 
-        // Update unread flag in list locally without unnecessary full reload
+        // Update unread flag & live badge counter immediately if this ticket was unread
+        let wasUnread = false;
         setTickets((prev) =>
-          prev.map((t) => (t.id === ticketId ? { ...t, unreadForOwner: false } : t))
+          prev.map((t) => {
+            if (t.id === ticketId && t.unreadForOwner) {
+              wasUnread = true;
+              return { ...t, unreadForOwner: false };
+            }
+            return t;
+          })
         );
+        if (wasUnread) {
+          setStats((prevStats) => {
+            const nextStats = {
+              ...prevStats,
+              unreadForOwnerCount: Math.max(0, prevStats.unreadForOwnerCount - 1),
+            };
+            onStatsChange?.(nextStats);
+            return nextStats;
+          });
+        }
       } catch (err: any) {
         setDetailError(err?.message || 'Unable to inspect ticket details.');
       } finally {
         setIsDetailLoading(false);
       }
     },
-    []
+    [onStatsChange]
   );
 
   const resolvedLinkedOrder: Order | null = useMemo(() => {
@@ -270,6 +290,13 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
     }
     return null;
   }, [linkedOrderFromServer, selectedTicket, orders]);
+
+  const resolvedLinkedRider: DeliveryPartner | null = useMemo(() => {
+    const riderId =
+      resolvedLinkedOrder?.deliveryPartnerId || selectedTicket?.orderSnapshot?.riderId;
+    if (!riderId) return null;
+    return deliveryPartners.find((dp) => dp.id === riderId) || null;
+  }, [deliveryPartners, resolvedLinkedOrder, selectedTicket]);
 
   const handleMetaUpdate = async (updates: {
     status?: SupportTicketStatus;
@@ -1114,9 +1141,15 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
                         </span>
                         <strong className="text-slate-900 block mt-0.5">
                           {resolvedLinkedOrder?.deliveryPartnerName ||
+                            resolvedLinkedRider?.fullName ||
                             selectedTicket.orderSnapshot?.riderName ||
                             'Unassigned'}
                         </strong>
+                        {resolvedLinkedRider && (
+                          <span className="text-[10px] text-slate-500 block mt-0.5 font-mono">
+                            {resolvedLinkedRider.phone} · {resolvedLinkedRider.vehicleType}
+                          </span>
+                        )}
                       </div>
 
                       <div className="bg-white p-2 rounded-lg border border-emerald-100">

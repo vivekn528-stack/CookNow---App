@@ -323,7 +323,7 @@ service cloud.firestore {
         resource.data.customerId == request.auth.uid || isSuperAdmin()
       );
 
-      // Customers can create tickets for themselves with safe initial state (cannot pre-approve refunds)
+      // Customers can create tickets for themselves with safe initial state (cannot pre-approve refunds or forge CSAT/assignee/resolution fields)
       allow create: if isValidTicketId(ticketId) && (
         isSuperAdmin() || (
           isAuthenticated() &&
@@ -340,12 +340,18 @@ service cloud.firestore {
           request.resource.data.description.size() <= 4000 &&
           request.resource.data.refund is map &&
           request.resource.data.refund.status in ['None', 'Requested'] &&
-          request.resource.data.refund.amount == 0
+          request.resource.data.refund.amount == 0 &&
+          request.resource.data.assignedAgentId == null &&
+          request.resource.data.assignedAgentName == null &&
+          request.resource.data.satisfactionRating == null &&
+          request.resource.data.resolvedAt == null &&
+          request.resource.data.closedAt == null &&
+          request.resource.data.internalNoteCount == 0
         )
       );
 
       // Super Admin can manage ticket lifecycle, assignment, and refunds.
-      // Owning customers can ONLY update reply read/preview metadata or submit CSAT after Resolved/Closed.
+      // Owning customers can ONLY update reply read/preview metadata (optionally moving 'Waiting for Customer' -> 'In Progress' on reply) or submit CSAT after Resolved/Closed.
       allow update: if isValidTicketId(ticketId) && (
         (
           isSuperAdmin() &&
@@ -358,7 +364,6 @@ service cloud.firestore {
           resource.data.customerId == request.auth.uid &&
           request.resource.data.customerId == resource.data.customerId &&
           request.resource.data.createdAt == resource.data.createdAt &&
-          request.resource.data.status == resource.data.status &&
           request.resource.data.priority == resource.data.priority &&
           request.resource.data.category == resource.data.category &&
           request.resource.data.refund == resource.data.refund &&
@@ -366,17 +371,26 @@ service cloud.firestore {
           request.resource.data.assignedAgentName == resource.data.assignedAgentName &&
           request.resource.data.resolvedAt == resource.data.resolvedAt &&
           request.resource.data.closedAt == resource.data.closedAt &&
+          request.resource.data.internalNoteCount == resource.data.internalNoteCount &&
           (
-            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-              'unreadForOwner',
-              'unreadForCustomer',
-              'lastMessagePreview',
-              'lastMessageAt',
-              'messageCount',
-              'history',
-              'updatedAt'
-            ]) || (
+            (
+              (
+                request.resource.data.status == resource.data.status ||
+                (resource.data.status == 'Waiting for Customer' && request.resource.data.status == 'In Progress')
+              ) &&
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'status',
+                'unreadForOwner',
+                'unreadForCustomer',
+                'lastMessagePreview',
+                'lastMessageAt',
+                'messageCount',
+                'history',
+                'updatedAt'
+              ])
+            ) || (
               resource.data.status in ['Resolved', 'Closed'] &&
+              request.resource.data.status == resource.data.status &&
               request.resource.data.diff(resource.data).affectedKeys().hasOnly([
                 'satisfactionRating',
                 'satisfactionFeedback',

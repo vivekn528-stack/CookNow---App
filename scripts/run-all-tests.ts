@@ -802,15 +802,27 @@ async function runTestSuite() {
     const ownerReadDetailRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}`, {
       token: ownerToken,
     });
+    const detailAuditActions = (ownerReadDetailRes.data?.auditLogs || []).map((l: any) => l.action);
     recordResult(
       'Owner GET ticket detail receives internalNotes, messages, linkedOrder & auditLogs',
       ownerReadDetailRes.status === 200 &&
         ownerReadDetailRes.data?.internalNotes?.length === 1 &&
         ownerReadDetailRes.data?.linkedOrder?.id === placedSmallOrder?.id &&
-        Array.isArray(ownerReadDetailRes.data?.auditLogs)
+        Array.isArray(ownerReadDetailRes.data?.auditLogs) &&
+        detailAuditActions.includes('SUPPORT_INTERNAL_NOTE_ADDED') &&
+        detailAuditActions.includes('SUPPORT_OWNER_REPLIED')
     );
 
     // Refund Validation & Audit Guards
+    const customerRefundDenied = await apiRequest(`/api/support/tickets/${orderTicket?.id}/refund`, {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        status: 'Approved',
+        amount: 49,
+        reason: 'Customer attempting self-approval',
+      },
+    });
     const overOrderRefundRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}/refund`, {
       method: 'POST',
       token: ownerToken,
@@ -855,8 +867,9 @@ async function runTestSuite() {
       },
     });
     recordResult(
-      'Refund engine blocks over-amount & unconfirmed Processed, and audits Approved -> Processed settlement',
-      overOrderRefundRes.status === 400 &&
+      'Refund engine blocks customer approval (403), over-amount & unconfirmed Processed, and audits Approved -> Processed settlement',
+      customerRefundDenied.status === 403 &&
+        overOrderRefundRes.status === 400 &&
         unconfirmedProcessedRefundRes.status === 400 &&
         approvedRefundRes.status === 200 &&
         processedRefundRes.status === 200 &&

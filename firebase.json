@@ -18,7 +18,8 @@
   "firestore": [
     {
       "database": "ai-studio-cooknowhomestyle-7c8332e7-39bc-4862-8a92-262d83edb331",
-      "rules": "firestore.rules"
+      "rules": "firestore.rules",
+      "indexes": "firestore.indexes.json"
     }
   ],
   "storage": {
