@@ -9,7 +9,7 @@
     },
     {
       "source": "/api/(.*)",
-      "destination": "/api"
+      "destination": "/api?__pathname=/api/$1"
     },
     {
       "source": "/(.*)",

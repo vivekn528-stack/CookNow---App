@@ -55,12 +55,6 @@ import {
   ExpenseCategory,
 } from '../types';
 import { OWNER_PROFILE, StorageManager } from '../lib/storage';
-import {
-  supabaseService,
-  isSupabaseConfigured,
-  getSupabaseDiagnostics,
-  getSupabaseConfig,
-} from '../lib/supabase';
 import { firestoreService } from '../lib/firestore';
 import { getFirebaseAuth } from '../lib/firebase';
 import {
@@ -206,8 +200,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Connection testing states
   const [firestoreTestStatus, setFirestoreTestStatus] = useState<{ text: string; isSuccess: boolean } | null>(null);
   const [isFirestoreTesting, setIsFirestoreTesting] = useState(false);
-  const [supabaseTestStatus, setSupabaseTestStatus] = useState<{ text: string; isSuccess: boolean; dashboardUrl?: string } | null>(null);
-  const [isSupabaseTesting, setIsSupabaseTesting] = useState(false);
 
   // Dynamic Real-time Connection Status (LIVE | CACHED | OFFLINE)
   const [dbConnectionStatus, setDbConnectionStatus] = useState<'LIVE' | 'CACHED' | 'OFFLINE'>('LIVE');
@@ -2733,9 +2725,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <div>
                   <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full bg-emerald-500" />
-                    Cloud Firestore (Google Cloud)
+                    Cloud Firestore (PRIMARY DATABASE)
                   </h3>
-                  <p className="text-slate-500 text-[11px]">Primary catalog & operational database</p>
+                  <p className="text-slate-500 text-[11px]">Primary catalog, orders &amp; financial ledger (Google Cloud)</p>
                 </div>
                 <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 text-emerald-800">
                   Spark Plan ($0.00)
@@ -2786,62 +2778,49 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
             </div>
 
-            {/* Supabase PostgreSQL Card */}
+            {/* Supabase PostgreSQL Card (Optional Standby Only) */}
             <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-4 shadow-xs">
               <div className="flex items-center justify-between">
                 <div>
                   <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                    <span className={`w-2 h-2 rounded-full ${isSupabaseConfigured() ? 'bg-emerald-500' : 'bg-amber-500'}`} />
-                    Supabase PostgreSQL Database
+                    <span className="w-2 h-2 rounded-full bg-slate-400" />
+                    Supabase PostgreSQL (Optional Standby)
                   </h3>
-                  <p className="text-slate-500 text-[11px]">Relational transactional order backend</p>
+                  <p className="text-slate-500 text-[11px]">Optional archive only · Not required for live operations</p>
                 </div>
-                <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${isSupabaseConfigured() ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
-                  {isSupabaseConfigured() ? 'Connected' : 'Free Tier (Paused)'}
+                <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-700">
+                  Not Required — Inactive
                 </span>
               </div>
 
               <div className="p-3 bg-slate-50 rounded-xl space-y-1 font-mono text-[11px] text-slate-700 border border-slate-200/80">
-                <div>URL: <strong>{getSupabaseConfig().url || 'https://tphoggbtizpzudbhgtjo.supabase.co'}</strong></div>
-                <div>Status: <span className="font-sans">{getSupabaseDiagnostics().message}</span></div>
+                <div>Role: <strong>OPTIONAL / STANDBY / NOT REQUIRED</strong></div>
+                <div>
+                  Status:{' '}
+                  <span className="font-sans">
+                    Cloud Firestore (cooknow-9444c) is the Primary Database. SQL migrations are preserved in supabase/migrations/.
+                  </span>
+                </div>
               </div>
 
-              {supabaseTestStatus && (
-                <div className={`p-2.5 rounded-lg border font-mono text-[11px] ${supabaseTestStatus.isSuccess ? 'bg-emerald-50 border-emerald-200 text-emerald-900' : 'bg-amber-50 border-amber-200 text-amber-900'}`}>
-                  {supabaseTestStatus.text}
-                </div>
-              )}
-
-              <div className="flex gap-2">
+              <div className="flex gap-2 opacity-70">
                 <button
-                  disabled={isSupabaseTesting}
-                  onClick={async () => {
-                    setIsSupabaseTesting(true);
-                    setSupabaseTestStatus(null);
-                    try {
-                      const res = await supabaseService.testConnection();
-                      setIsSupabaseTesting(false);
-                      setSupabaseTestStatus({
-                        text: res.connected ? `✅ Connected: ${res.message}` : `❌ Status: ${res.message}`,
-                        isSuccess: res.connected,
-                        dashboardUrl: res.dashboardUrl,
-                      });
-                    } catch (e: any) {
-                      setIsSupabaseTesting(false);
-                      setSupabaseTestStatus({ text: `❌ Error: ${e.message}`, isSuccess: false });
-                    }
-                  }}
-                  className="flex-1 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold rounded-xl cursor-pointer"
+                  type="button"
+                  disabled
+                  aria-disabled="true"
+                  className="flex-1 py-2 bg-slate-100 text-slate-500 font-semibold rounded-xl cursor-not-allowed"
                 >
-                  {isSupabaseTesting ? 'Testing...' : 'Test Database'}
+                  Test Disabled (Standby)
                 </button>
 
                 {onOpenSupabaseConfig && (
                   <button
-                    onClick={onOpenSupabaseConfig}
-                    className="flex-1 py-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded-xl cursor-pointer"
+                    type="button"
+                    disabled
+                    aria-disabled="true"
+                    className="flex-1 py-2 bg-slate-200 text-slate-500 font-semibold rounded-xl cursor-not-allowed"
                   >
-                    Configure URL
+                    Config Disabled (Standby)
                   </button>
                 )}
               </div>

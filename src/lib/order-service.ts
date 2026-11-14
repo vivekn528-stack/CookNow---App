@@ -76,7 +76,15 @@ export async function placeCustomerOrder(
       body: JSON.stringify(payload),
     });
 
-    const data = await res.json().catch(() => null);
+    const rawText = await res.text();
+    let data: any = null;
+    if (rawText) {
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        data = null;
+      }
+    }
 
     if (res.ok && data?.success && data.order) {
       return {
@@ -87,19 +95,74 @@ export async function placeCustomerOrder(
       };
     }
 
+    const extractedError =
+      data?.error ||
+      data?.message ||
+      `Backend returned HTTP ${res.status}${res.statusText ? ` (${res.statusText})` : ''}. Please retry.`;
+
+    console.error('[OrderService] Server rejected order placement:', {
+      status: res.status,
+      error: extractedError,
+    });
+
     return {
       success: false,
       order: null,
-      error: data?.error || 'Order could not be confirmed by the server backend. Please retry.',
+      error: extractedError,
       fromServerFunction: true,
     };
   } catch (err: any) {
+    const message = err?.message || 'Network error communicating with order backend.';
+    console.error('[OrderService] Network error during order placement:', message);
     return {
       success: false,
       order: null,
-      error: err?.message || 'Network error communicating with order backend.',
+      error: message,
       fromServerFunction: true,
     };
+  }
+}
+
+/**
+ * Synchronize order status transitions with the server-authoritative backend.
+ */
+export async function updateOrderStatusOnServer(
+  orderId: string,
+  status: string,
+  options?: { cancellationReason?: string; partnerId?: string; partnerName?: string }
+): Promise<{ success: boolean; order?: Order; error?: string }> {
+  const auth = getFirebaseAuth();
+  const currentUser = auth?.currentUser;
+  if (!currentUser) {
+    return { success: false, error: 'Authentication required.' };
+  }
+
+  try {
+    const idToken = await currentUser.getIdToken();
+    const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/status`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+      body: JSON.stringify({
+        status,
+        cancellationReason: options?.cancellationReason,
+        partnerId: options?.partnerId,
+        partnerName: options?.partnerName,
+      }),
+    });
+
+    const data = await res.json().catch(() => null);
+    if (res.ok && data?.success) {
+      return { success: true, order: data.order };
+    }
+    return {
+      success: false,
+      error: data?.error || `Server returned HTTP ${res.status}`,
+    };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Network error updating order status.' };
   }
 }
 
@@ -137,4 +200,3 @@ export async function fetchCustomerOrders(): Promise<{
     return { success: false, orders: [], error: err.message };
   }
 }
-

@@ -41,15 +41,8 @@ import {
   Profile,
 } from './types';
 import { OWNER_PROFILE, StorageManager } from './lib/storage';
-import {
-  supabaseService,
-  isSupabaseConfigured,
-  getSupabaseDiagnostics,
-  getSupabaseConfig,
-  hydrateSupabaseFromPublicApi,
-} from './lib/supabase';
 import { firestoreService } from './lib/firestore';
-import { placeCustomerOrder } from './lib/order-service';
+import { placeCustomerOrder, updateOrderStatusOnServer } from './lib/order-service';
 import { FALLBACK_KITCHEN_AVATAR } from './lib/image-registry';
 import {
   signOutFirebase,
@@ -80,16 +73,14 @@ import { DatabaseGuideModal } from './components/DatabaseGuideModal';
 import { SupabaseConfigModal } from './components/SupabaseConfigModal';
 
 export default function App() {
-  // Backend Integration State (Firebase Firestore primary + Supabase secondary + Local fallback)
+  // Backend Integration State (Firebase Cloud Firestore Single Source of Truth)
   type BackendStatusMode = 'live_firestore' | 'offline_fallback' | 'query_error';
   const [backendStatusMode, setBackendStatusMode] = useState<BackendStatusMode>('live_firestore');
   const [backendStatusDetails, setBackendStatusDetails] = useState<string>('Syncing Cloud Firestore...');
   const [firestoreQueryError, setFirestoreQueryError] = useState<string | null>(null);
   const [isLiveFirestore, setIsLiveFirestore] = useState<boolean>(true);
   const [firestoreNotice, setFirestoreNotice] = useState<string | null>(null);
-  const [isLiveSupabase, setIsLiveSupabase] = useState<boolean>(() => isSupabaseConfigured());
   const [isBackendLoading, setIsBackendLoading] = useState<boolean>(false);
-  const [backendError, setBackendError] = useState<string | null>(null);
   const [isSupabaseModalOpen, setIsSupabaseModalOpen] = useState(false);
   const [adminCooks, setAdminCooks] = useState<Cook[]>([]);
 
@@ -175,7 +166,6 @@ export default function App() {
 
   const loadLiveBackendData = async () => {
     setIsBackendLoading(true);
-    setBackendError(null);
     setFirestoreQueryError(null);
     setFirestoreNotice(null);
 
@@ -297,14 +287,6 @@ export default function App() {
         setBackendStatusDetails('Operating with local StorageManager pilot data fallback (offline baseline).');
         setFirestoreNotice('Operating with local StorageManager pilot baseline.');
       }
-
-      // Check secondary Supabase status if configured (for dual-read / migration verification)
-      await hydrateSupabaseFromPublicApi();
-      if (isSupabaseConfigured()) {
-        setIsLiveSupabase(true);
-      } else {
-        setIsLiveSupabase(false);
-      }
     } catch (err: any) {
       console.warn('Firestore backend notice:', err);
       setBackendStatusMode('query_error');
@@ -317,59 +299,7 @@ export default function App() {
     }
   };
 
-  const loadLiveSupabaseData = async () => {
-    setIsBackendLoading(true);
-    setBackendError(null);
-    try {
-      await hydrateSupabaseFromPublicApi();
-      if (!isSupabaseConfigured()) {
-        setIsLiveSupabase(false);
-        return;
-      }
-
-      const [cooksRes, menuRes, ordersRes, reviewsRes, partnerRes, ridersRes, plansRes, subsRes] =
-        await Promise.all([
-          supabaseService.fetchCooks(),
-          supabaseService.fetchMenuItems(),
-          supabaseService.fetchOrders(),
-          supabaseService.fetchReviews(),
-          supabaseService.fetchPartnerApplications(),
-          supabaseService.fetchDeliveryPartners(),
-          supabaseService.fetchMealPlans(),
-          supabaseService.fetchSubscriptions(),
-        ]);
-
-      if (cooksRes.error && menuRes.error) {
-        setBackendError(`Supabase notice: ${cooksRes.error}.`);
-        setIsLiveSupabase(false);
-        return;
-      }
-
-      if (cooksRes.data && cooksRes.data.length > 0) {
-        setCooks(cooksRes.data);
-        setCurrentCook(cooksRes.data[0]);
-      }
-      if (menuRes.data && menuRes.data.length > 0) setMenuItems(menuRes.data);
-      if (ordersRes.data && ordersRes.data.length > 0) setOrders(ordersRes.data);
-      if (reviewsRes.data && reviewsRes.data.length > 0) setReviews(reviewsRes.data);
-      if (partnerRes.data && partnerRes.data.length > 0) setPartnerApplications(partnerRes.data);
-      if (ridersRes.data && ridersRes.data.length > 0) {
-        setDeliveryPartners(ridersRes.data);
-        setCurrentRider(ridersRes.data[0]);
-      }
-      if (plansRes.data && plansRes.data.length > 0) setMealPlans(plansRes.data);
-      if (subsRes.data && subsRes.data.length > 0) setSubscriptions(subsRes.data);
-
-      setIsLiveSupabase(true);
-    } catch (err: any) {
-      setBackendError(err.message || 'Supabase network exception');
-      setIsLiveSupabase(false);
-    } finally {
-      setIsBackendLoading(false);
-    }
-  };
-
-  // Initial load from Cloud Firestore + Supabase migration probe
+  // Initial load from Cloud Firestore
   useEffect(() => {
     loadLiveBackendData();
   }, []);
@@ -612,13 +542,8 @@ export default function App() {
     setIsCheckoutOpen(false);
     setTrackedOrder(confirmedOrder);
     showToast(
-      `Order #${confirmedOrder.id} placed & secured ${orderRes.fromServerFunction ? 'via Cloud Functions' : 'in Cloud Firestore'}!`
+      `Order #${confirmedOrder.id} placed & secured ${orderRes.fromServerFunction ? 'via server API & Firestore' : 'in Cloud Firestore'}!`
     );
-
-    // Secondary sync to Supabase during Phase 3 migration if configured
-    if (isSupabaseConfigured()) {
-      supabaseService.insertOrder(confirmedOrder).catch(() => {});
-    }
   };
 
   const handleCancelOrder = async (orderId: string, reason: string) => {
@@ -645,16 +570,14 @@ export default function App() {
       })
     );
 
-    // Primary: Cloud Firestore update
+    const serverRes = await updateOrderStatusOnServer(orderId, 'cancelled', {
+      cancellationReason: reason,
+    });
     const firestoreRes = await firestoreService.updateOrderStatus(orderId, 'cancelled', reason);
-    if (firestoreRes.error) {
-      showToast(`⚠️ Firestore cancel notice: ${firestoreRes.error}`);
+    if (!serverRes.success && firestoreRes.error) {
+      showToast(`⚠️ Cancel notice: ${serverRes.error || firestoreRes.error}`);
     } else {
       showToast(`Order #${orderId} cancelled & updated in Cloud Firestore.`);
-    }
-
-    if (isSupabaseConfigured()) {
-      supabaseService.updateOrderStatus(orderId, 'cancelled', reason).catch(() => {});
     }
   };
 
@@ -787,16 +710,15 @@ export default function App() {
       })
     );
 
-    // Primary: Cloud Firestore update
+    // Sync with server-authoritative backend + Cloud Firestore
+    const serverRes = await updateOrderStatusOnServer(orderId, nextStatus, {
+      cancellationReason: reason,
+    });
     const firestoreRes = await firestoreService.updateOrderStatus(orderId, nextStatus, reason);
-    if (firestoreRes.error) {
-      showToast(`⚠️ Firestore update notice: ${firestoreRes.error}`);
+    if (!serverRes.success && firestoreRes.error) {
+      showToast(`⚠️ Status update notice: ${serverRes.error || firestoreRes.error}`);
     } else {
       showToast(`Order #${orderId} updated to ${nextStatus.replace(/_/g, ' ')} in Cloud Firestore!`);
-    }
-
-    if (isSupabaseConfigured()) {
-      supabaseService.updateOrderStatus(orderId, nextStatus, reason).catch(() => {});
     }
   };
 
@@ -848,12 +770,13 @@ export default function App() {
       );
     }
 
-    // Primary: Cloud Firestore delivery partner assignment and status update
+    // Primary: Server API + Cloud Firestore delivery partner assignment and status update
     const deliveryStatus = status === 'delivered' ? 'delivered' : 'out_for_delivery';
+    const serverRes = await updateOrderStatusOnServer(orderId, status, { partnerId, partnerName });
     const firestoreRes = await firestoreService.updateOrderDeliveryStatus(orderId, deliveryStatus, partnerId, partnerName);
     await firestoreService.updateOrderStatus(orderId, status);
-    if (firestoreRes.error) {
-      showToast(`⚠️ Firestore rider notice: ${firestoreRes.error}`);
+    if (!serverRes.success && firestoreRes.error) {
+      showToast(`⚠️ Rider update notice: ${serverRes.error || firestoreRes.error}`);
     } else {
       showToast(`Order #${orderId} delivery status: ${status.replace(/_/g, ' ')} (Firestore)`);
     }
@@ -908,11 +831,6 @@ export default function App() {
     await firestoreService.updatePartnerApplicationStatus(appId, 'approved', reason, OWNER_PROFILE.fullName);
     await firestoreService.insertCook(newCook);
 
-    if (isSupabaseConfigured()) {
-      supabaseService.updatePartnerApplicationStatus(appId, 'approved', reason, OWNER_PROFILE.fullName).catch(() => {});
-      supabaseService.insertCook(newCook).catch(() => {});
-    }
-
     showToast(`Approved ${app.businessName} as verified partner in Cloud Firestore!`);
   };
 
@@ -927,10 +845,6 @@ export default function App() {
     );
 
     await firestoreService.updatePartnerApplicationStatus(appId, 'rejected', reason, OWNER_PROFILE.fullName);
-
-    if (isSupabaseConfigured()) {
-      supabaseService.updatePartnerApplicationStatus(appId, 'rejected', reason, OWNER_PROFILE.fullName).catch(() => {});
-    }
 
     showToast(`Partner application rejected with recorded audit reason in Cloud Firestore.`);
   };
@@ -947,10 +861,6 @@ export default function App() {
 
     await firestoreService.updateDeliveryPartnerStatus(partnerId, 'approved', notes);
 
-    if (isSupabaseConfigured()) {
-      supabaseService.updateDeliveryPartnerStatus(partnerId, 'approved', notes).catch(() => {});
-    }
-
     showToast(`Rider approved to accept Nalapani Chowk deliveries in Cloud Firestore!`);
   };
 
@@ -964,10 +874,6 @@ export default function App() {
     );
 
     await firestoreService.updateDeliveryPartnerStatus(partnerId, 'rejected', reason);
-
-    if (isSupabaseConfigured()) {
-      supabaseService.updateDeliveryPartnerStatus(partnerId, 'rejected', reason).catch(() => {});
-    }
 
     showToast(`Rider application rejected in Cloud Firestore.`);
   };
@@ -997,10 +903,6 @@ export default function App() {
 
     await firestoreService.updateOrderDeliveryStatus(orderId, 'assigned', partnerId, partnerName);
 
-    if (isSupabaseConfigured()) {
-      supabaseService.updateOrderStatus(orderId, 'ready').catch(() => {});
-    }
-
     showToast(`Order #${orderId} assigned to ${partnerName} (Cloud Firestore).`);
   };
 
@@ -1013,10 +915,6 @@ export default function App() {
       showToast(`⚠️ Firestore subscription note: ${res.error}. Persisted locally.`);
     } else {
       showToast(`Subscribed to ${sub.planTitle}! Saved in Cloud Firestore.`);
-    }
-
-    if (isSupabaseConfigured()) {
-      supabaseService.insertSubscription(sub).catch(() => {});
     }
   };
 
@@ -1088,10 +986,6 @@ export default function App() {
     if (res.error) {
       showToast(`⚠️ Firestore review verification note: ${res.error}`);
       return;
-    }
-
-    if (isSupabaseConfigured()) {
-      supabaseService.insertReview(newReview).catch(() => {});
     }
 
     showToast('Thank you for reviewing! Secured in Cloud Firestore.');
@@ -1206,14 +1100,17 @@ export default function App() {
           </div>
           <div className="flex items-center gap-3">
             <span className="text-[10px] text-stone-500 flex items-center gap-1.5">
-              <span className={`w-2 h-2 rounded-full ${isLiveSupabase ? 'bg-emerald-500' : 'bg-stone-300'}`} />
-              <span>Supabase {isLiveSupabase ? 'Active (Dual-Sync)' : 'Standby'}</span>
+              <span className="w-2 h-2 rounded-full bg-emerald-500" />
+              <span>Cloud Firestore: Primary Database</span>
+            </span>
+            <span className="hidden sm:inline-flex items-center gap-1.5 text-[10px] text-stone-400">
+              <span>Supabase: Optional Standby (Inactive)</span>
             </span>
             <button
               onClick={() => setIsDbGuideOpen(true)}
               className="text-stone-600 hover:text-stone-900 font-semibold cursor-pointer underline underline-offset-2"
             >
-              Migration & Schema Guide
+              Architecture & Database Guide
             </button>
             <button
               onClick={() => loadLiveBackendData()}
@@ -1622,10 +1519,6 @@ export default function App() {
               } else {
                 showToast(`Saved dish: "${itemToSave.name}" in Cloud Firestore!`);
               }
-
-              if (isSupabaseConfigured()) {
-                supabaseService.saveMenuItem(itemToSave).catch(() => {});
-              }
             }}
             onDeleteMenuItem={async (itemId) => {
               setMenuItems((prev) => prev.filter((i) => i.id !== itemId));
@@ -1634,10 +1527,6 @@ export default function App() {
                 showToast(`⚠️ Firestore delete note: ${res.error}`);
               } else {
                 showToast('Dish removed from Cloud Firestore.');
-              }
-
-              if (isSupabaseConfigured()) {
-                supabaseService.deleteMenuItem(itemId).catch(() => {});
               }
             }}
             onUpdateOrderStatus={handleUpdateOrderStatus}
@@ -1858,14 +1747,13 @@ export default function App() {
         onOpenSupabaseConfig={() => setIsSupabaseModalOpen(true)}
       />
 
-      {/* Supabase Connection & Configuration Modal */}
+      {/* Supabase Optional Standby Architecture Modal */}
       <SupabaseConfigModal
         isOpen={isSupabaseModalOpen}
         onClose={() => setIsSupabaseModalOpen(false)}
         onConnectionSuccess={() => {
           setIsSupabaseModalOpen(false);
-          loadLiveSupabaseData();
-          showToast('Supabase connection verified! Synced with PostgreSQL.');
+          showToast('Cloud Firestore (cooknow-9444c) remains the active Primary Database.');
         }}
       />
 
@@ -1922,13 +1810,13 @@ export default function App() {
             <div className="space-y-2">
               <span className="font-bold text-stone-200">Full-Stack Architecture</span>
               <p className="text-stone-400 text-[11px] leading-relaxed">
-                Supabase PostgreSQL schemas with Row-Level Security (RLS) & server-side payment verification boundary.
+                Cloud Firestore (cooknow-9444c) Primary Database, Firebase Auth & Storage, and server-authoritative COD order verification.
               </p>
               <button
                 onClick={() => setIsDbGuideOpen(true)}
                 className="mt-2 text-emerald-400 hover:text-emerald-300 font-semibold underline underline-offset-4 cursor-pointer"
               >
-                View Setup & Migration SQL
+                View Architecture & Deployment Guide
               </button>
             </div>
           </div>

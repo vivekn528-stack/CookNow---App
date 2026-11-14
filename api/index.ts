@@ -1,50 +1,28 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'node:crypto';
 import { promises as dnsPromises } from 'dns';
-import { createClient } from '@supabase/supabase-js';
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createRemoteJWKSet, createLocalJWKSet, jwtVerify } from 'jose';
 import { initializeApp, getApps, cert, type ServiceAccount } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 
 dotenv.config();
 
-const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
-
-// Ensure public Firebase Web App client environment variables are synced to .env (local dev only)
-if (!isServerless) {
-  try {
-    const envPath = path.resolve(process.cwd(), '.env');
-    const publicKeys = [
-      'VITE_FIREBASE_API_KEY',
-      'VITE_FIREBASE_APP_ID',
-      'VITE_FIREBASE_AUTH_DOMAIN',
-      'VITE_FIREBASE_PROJECT_ID',
-      'VITE_FIREBASE_STORAGE_BUCKET',
-      'VITE_FIREBASE_MESSAGING_SENDER_ID',
-    ];
-    let envLines: string[] = [];
-    if (fs.existsSync(envPath)) {
-      const existing = fs.readFileSync(envPath, 'utf8').split('\n');
-      envLines = existing.filter((l) => l.trim() && !publicKeys.some((k) => l.startsWith(`${k}=`)));
-    }
-    for (const k of publicKeys) {
-      if (process.env[k]) {
-        envLines.push(`${k}="${process.env[k]}"`);
-      }
-    }
-    if (envLines.length > 0) {
-      fs.writeFileSync(envPath, envLines.join('\n') + '\n', 'utf8');
-    }
-  } catch (e) {
-    // Non-fatal if read-only filesystem
-  }
-}
+const isServerlessRuntime = () =>
+  Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 
 const app = express();
 const router = express.Router();
+
+function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<any> | any
+) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
 
 // Enable CORS for all API routes before any body parsing
 app.use((req: Request, res: Response, next) => {
@@ -66,9 +44,26 @@ app.use((req: Request, res: Response, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Vercel Serverless Path Normalization Middleware
+// Vercel Serverless Path Normalization Middleware (recovers rewritten /api/(.*) path)
 app.use((req: Request, _res: Response, next) => {
-  if (req.originalUrl && req.originalUrl.startsWith('/api') && (req.url === '/' || req.url === '')) {
+  const pathnameParam = req.query?.__pathname;
+  if (typeof pathnameParam === 'string' && pathnameParam.startsWith('/api')) {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(req.query)) {
+      if (key === '__pathname') continue;
+      if (Array.isArray(value)) {
+        value.forEach((v) => params.append(key, String(v)));
+      } else if (value !== undefined) {
+        params.append(key, String(value));
+      }
+    }
+    const qs = params.toString();
+    req.url = qs ? `${pathnameParam}?${qs}` : pathnameParam;
+  } else if (
+    req.originalUrl &&
+    req.originalUrl.startsWith('/api') &&
+    (req.url === '/' || req.url === '')
+  ) {
     req.url = req.originalUrl;
   }
   next();
@@ -93,7 +88,14 @@ export interface VerifiedFirebaseUser {
 }
 
 export async function verifyFirebaseIdToken(token: string): Promise<VerifiedFirebaseUser> {
-  const { payload } = await jwtVerify(token, FIREBASE_JWKS, {
+  const jwksResolver =
+    process.env.NODE_ENV === 'test' &&
+    process.env.IS_TEST === 'true' &&
+    process.env.COOKNOW_TEST_PUBLIC_JWK
+      ? createLocalJWKSet({ keys: [JSON.parse(process.env.COOKNOW_TEST_PUBLIC_JWK)] })
+      : FIREBASE_JWKS;
+
+  const { payload } = await jwtVerify(token, jwksResolver, {
     issuer: `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`,
     audience: FIREBASE_PROJECT_ID,
     algorithms: ['RS256'],
@@ -185,20 +187,8 @@ try {
 }
 
 // ------------------------------------------------------------------------------
-// SUPABASE CLIENT (SERVER-SIDE)
-// ------------------------------------------------------------------------------
-function getSupabaseServerClient() {
-  const url = process.env.VITE_SUPABASE_URL || '';
-  const serviceKey =
-    process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || '';
-  if (!url || !serviceKey) return null;
-  return createClient(url, serviceKey, {
-    auth: { persistSession: false },
-  });
-}
-
-// ------------------------------------------------------------------------------
-// APPROVED PLATFORM CONSTANTS & CANONICAL CATALOG
+// APPROVED PLATFORM CONSTANTS & CANONICAL CATALOG (Fallback for local test mode)
+// Preserves immutable business settings & Student Special Thali prices
 // ------------------------------------------------------------------------------
 const OWNER_EMAIL = 'vivekn528@gmail.com';
 
@@ -208,33 +198,51 @@ const PLATFORM_SETTINGS = {
   freeDeliveryThreshold: 250,
   platformServiceFee: 5,
   packagingFee: 10,
+  taxRatePercent: 0,
   launchLocality: 'Nalapani Chowk, Dehradun',
-  supportPhone: '+91 98765 43210',
-  supportEmail: 'support@cooknow.in',
+  supportPhone: '+91 94120 44556',
+  supportEmail: 'support@cooknow-dehradun.in',
 };
 
-// Approved baseline meals for canonical price verification (anti-tampering)
+const ALLOWED_ORDER_TRANSITIONS: Record<string, string[]> = {
+  pending: ['accepted', 'cancelled'],
+  accepted: ['preparing', 'cancelled'],
+  preparing: ['ready'],
+  ready: ['out_for_delivery'],
+  out_for_delivery: ['delivered'],
+  delivered: [],
+  cancelled: [],
+};
+
+const CANONICAL_COOKS: Record<
+  string,
+  { id: string; userId: string; kitchenName: string; isVerified: boolean; isAcceptingOrders: boolean }
+> = {
+  'cook-1': { id: 'cook-1', userId: 'user-cook-1', kitchenName: "Sunita's Pahadi Rasoi", isVerified: true, isAcceptingOrders: true },
+  'cook-2': { id: 'cook-2', userId: 'user-cook-2', kitchenName: "Aunty's Ghar Ka Khana", isVerified: true, isAcceptingOrders: true },
+  'cook-3': { id: 'cook-3', userId: 'user-cook-3', kitchenName: 'Doon Punjabi Kitchenette', isVerified: true, isAcceptingOrders: true },
+  'cook-4': { id: 'cook-4', userId: 'user-cook-4', kitchenName: 'Garhwal Bhojanalaya (Restaurant Partner)', isVerified: true, isAcceptingOrders: true },
+  'cook-5': { id: 'cook-5', userId: 'user-cook-5', kitchenName: 'Pahadi Zaika (Pending Audit)', isVerified: false, isAcceptingOrders: false },
+};
+
+// Approved canonical meals matching INITIAL_MENU_ITEMS in src/lib/storage.ts
 const CANONICAL_MEALS: Record<
   string,
-  { name: string; price: number; dietaryType: 'pure_veg' | 'egg' | 'non_veg'; cookId: string }
+  { name: string; price: number; dietaryType: 'pure_veg' | 'egg' | 'non_veg'; cookId: string; isAvailable: boolean }
 > = {
-  'meal-thali-mini': { name: 'Student Mini Thali', price: 49, dietaryType: 'pure_veg', cookId: 'cook-meenakshi' },
-  'meal-thali-reg': { name: 'Student Regular Thali', price: 69, dietaryType: 'pure_veg', cookId: 'cook-meenakshi' },
-  'meal-thali-full': { name: 'Student Deluxe Thali', price: 79, dietaryType: 'pure_veg', cookId: 'cook-meenakshi' },
-  'meal-rajma-chawal': { name: 'Ghar Ke Rajma Chawal', price: 89, dietaryType: 'pure_veg', cookId: 'cook-meenakshi' },
-  'meal-kadhi-pakoda': { name: 'Pahadi Dahi Kadhi Pakoda', price: 85, dietaryType: 'pure_veg', cookId: 'cook-meenakshi' },
-  'meal-aloo-gutke': { name: 'Kumaoni Aloo Ke Gutke & Poori', price: 75, dietaryType: 'pure_veg', cookId: 'cook-meenakshi' },
-  'meal-dal-tadka': { name: 'Homestyle Dal Tadka & Jeera Rice', price: 80, dietaryType: 'pure_veg', cookId: 'cook-kamla' },
-  'meal-aloo-paratha': { name: 'Tawa Aloo Paratha (2 Pcs with Curd)', price: 65, dietaryType: 'pure_veg', cookId: 'cook-kamla' },
-  'meal-paneer-bhurji': { name: 'Paneer Bhurji & Tawa Roti Meal', price: 110, dietaryType: 'pure_veg', cookId: 'cook-kamla' },
-  'meal-egg-curry': { name: 'Desi Style Egg Curry (2 Eggs) & Rice', price: 95, dietaryType: 'egg', cookId: 'cook-kamla' },
-  'meal-chicken-pahadi': { name: 'Pahadi Tari Chicken & Steamed Rice', price: 140, dietaryType: 'non_veg', cookId: 'cook-sunita' },
-  'meal-chicken-curry-roti': { name: 'Homestyle Chicken Curry & 4 Phulkas', price: 135, dietaryType: 'non_veg', cookId: 'cook-sunita' },
-  'meal-gahat-dal': { name: 'Garhwali Kulath (Gahat) Ki Dal & Rice', price: 90, dietaryType: 'pure_veg', cookId: 'cook-sunita' },
-  'meal-choor-paratha': { name: 'Pahadi Choor Paratha with Makkhan', price: 70, dietaryType: 'pure_veg', cookId: 'cook-sunita' },
+  'menu-student-mini': { name: 'Mini Student Comfort Meal', price: 49, dietaryType: 'pure_veg', cookId: 'cook-2', isAvailable: true },
+  'menu-student-regular': { name: 'Regular Student Thali', price: 69, dietaryType: 'pure_veg', cookId: 'cook-4', isAvailable: true },
+  'menu-student-full': { name: 'Full Student Deluxe Thali', price: 79, dietaryType: 'pure_veg', cookId: 'cook-1', isAvailable: true },
+  'menu-1': { name: 'Special Garhwali Homestyle Thali', price: 160, dietaryType: 'pure_veg', cookId: 'cook-1', isAvailable: true },
+  'menu-pahadi-aloo': { name: 'Pahadi Aloo Ke Gutke & Mandua Roti', price: 120, dietaryType: 'pure_veg', cookId: 'cook-1', isAvailable: true },
+  'menu-2': { name: 'Gahat (Kulath) Ki Daal & Phulka Combo', price: 130, dietaryType: 'pure_veg', cookId: 'cook-1', isAvailable: true },
+  'menu-3': { name: 'Homestyle Pahadi Rajma Chawal Bowl', price: 120, dietaryType: 'pure_veg', cookId: 'cook-2', isAvailable: true },
+  'menu-4': { name: 'Daily Student Comfort Tiffin', price: 110, dietaryType: 'pure_veg', cookId: 'cook-2', isAvailable: true },
+  'menu-5': { name: 'Makhan Aloo Paratha (2 Pcs)', price: 95, dietaryType: 'pure_veg', cookId: 'cook-3', isAvailable: true },
+  'menu-8': { name: 'Jhangora Ki Kheer (Barnyard Millet Pudding)', price: 80, dietaryType: 'pure_veg', cookId: 'cook-1', isAvailable: true },
 };
 
-// Approved promotions
+// Approved canonical promotions matching INITIAL_PROMOTIONS in src/lib/storage.ts
 const CANONICAL_PROMOS: Record<
   string,
   {
@@ -243,6 +251,8 @@ const CANONICAL_PROMOS: Record<
     discountValue: number;
     minOrderValue: number;
     maxDiscountCap: number;
+    fundingSource: 'cooknow_funded' | 'restaurant_funded' | 'shared_funded';
+    partnerSharePercent?: number;
     usageLimit: number;
     currentUsageCount: number;
     budgetLimit: number;
@@ -250,12 +260,53 @@ const CANONICAL_PROMOS: Record<
     isActive: boolean;
   }
 > = {
+  STUDENT49: {
+    name: 'Student Thali Special Offer',
+    discountType: 'fixed',
+    discountValue: 20,
+    minOrderValue: 69,
+    maxDiscountCap: 20,
+    fundingSource: 'cooknow_funded',
+    usageLimit: 500,
+    currentUsageCount: 78,
+    budgetLimit: 10000,
+    spentBudget: 1560,
+    isActive: true,
+  },
+  FIRSTCOOK: {
+    name: 'New Customer Welcome',
+    discountType: 'percentage',
+    discountValue: 20,
+    minOrderValue: 120,
+    maxDiscountCap: 50,
+    fundingSource: 'cooknow_funded',
+    usageLimit: 1000,
+    currentUsageCount: 142,
+    budgetLimit: 25000,
+    spentBudget: 4890,
+    isActive: true,
+  },
+  PAHADI15: {
+    name: 'Authentic Garhwal Flavors',
+    discountType: 'percentage',
+    discountValue: 15,
+    minOrderValue: 150,
+    maxDiscountCap: 45,
+    fundingSource: 'shared_funded',
+    partnerSharePercent: 50,
+    usageLimit: 300,
+    currentUsageCount: 41,
+    budgetLimit: 8000,
+    spentBudget: 1435,
+    isActive: true,
+  },
   WELCOME50: {
     name: 'First Order Welcome Offer',
     discountType: 'fixed',
     discountValue: 50,
     minOrderValue: 150,
     maxDiscountCap: 50,
+    fundingSource: 'cooknow_funded',
     usageLimit: 500,
     currentUsageCount: 42,
     budgetLimit: 25000,
@@ -268,6 +319,7 @@ const CANONICAL_PROMOS: Record<
     discountValue: 15,
     minOrderValue: 100,
     maxDiscountCap: 60,
+    fundingSource: 'cooknow_funded',
     usageLimit: 1000,
     currentUsageCount: 88,
     budgetLimit: 30000,
@@ -280,6 +332,7 @@ const CANONICAL_PROMOS: Record<
     discountValue: 20,
     minOrderValue: 200,
     maxDiscountCap: 100,
+    fundingSource: 'cooknow_funded',
     usageLimit: 300,
     currentUsageCount: 15,
     budgetLimit: 20000,
@@ -534,12 +587,54 @@ async function fetchSettlementsFromFirestoreOrCache(): Promise<any[]> {
   return Array.from(LIVE_SETTLEMENTS_CACHE.values());
 }
 
+async function fetchSingleOrder(orderId: string): Promise<any | null> {
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      const snap = await firestoreDb.collection('orders').doc(orderId).get();
+      if (snap.exists) {
+        const order = { id: snap.id, ...snap.data() };
+        LIVE_ORDERS_CACHE.set(order.id, order);
+        return order;
+      }
+    } catch (err: any) {
+      console.error('[Firestore] Failed reading single order:', { orderId, code: err?.code, message: err?.message });
+    }
+  }
+  return LIVE_ORDERS_CACHE.get(orderId) || null;
+}
+
+async function fetchSingleExpense(expenseId: string): Promise<any | null> {
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      const snap = await firestoreDb.collection('operating_expenses').doc(expenseId).get();
+      if (snap.exists) {
+        const exp = { id: snap.id, ...snap.data() };
+        LIVE_EXPENSES_CACHE.set(exp.id, exp);
+        return exp;
+      }
+    } catch (err: any) {
+      console.error('[Firestore] Failed reading expense:', { expenseId, code: err?.code, message: err?.message });
+    }
+  }
+  return LIVE_EXPENSES_CACHE.get(expenseId) || null;
+}
+
+class HttpRouteError extends Error {
+  status: number;
+  code?: string;
+  constructor(status: number, message: string, code?: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
 // ------------------------------------------------------------------------------
 // API ENDPOINTS
 // ------------------------------------------------------------------------------
 
 // 1. Server-Side Verification Endpoint for Owner / Super Admin
-router.post('/auth/verify-owner', async (req: Request, res: Response) => {
+router.post('/auth/verify-owner', asyncHandler(async (req: Request, res: Response) => {
   const verifiedUser = await extractVerifiedUser(req);
   if (!verifiedUser) {
     return res.status(401).json({
@@ -570,10 +665,10 @@ router.post('/auth/verify-owner', async (req: Request, res: Response) => {
       error: `Authenticated Google account (${verifiedUser.email}) is not authorized for Super Admin privileges. Restricted exclusively to ${OWNER_EMAIL}.`,
     });
   }
-});
+}));
 
-// 2. Server-Authoritative Order Placement Endpoint
-router.post('/orders/place', async (req: Request, res: Response) => {
+// 2. Server-Authoritative Order Placement Endpoint (Cloud Firestore Single Source of Truth)
+router.post('/orders/place', asyncHandler(async (req: Request, res: Response) => {
   // 2.1 Authenticate customer via cryptographic JWKS verification
   const verifiedUser = await extractVerifiedUser(req);
   if (!verifiedUser) {
@@ -583,10 +678,22 @@ router.post('/orders/place', async (req: Request, res: Response) => {
     });
   }
 
+  // In live serverless production, Firebase Admin credentials are mandatory so orders persist to Cloud Firestore
+  if (
+    isServerlessRuntime() &&
+    !hasAdminCredentials &&
+    (process.env.IS_TEST !== 'true' || process.env.TEST_ENFORCE_SERVERLESS_GUARD === 'true')
+  ) {
+    console.error('[Orders] Rejected placement: Missing Firebase Admin SDK credentials in serverless environment.');
+    return res.status(503).json({
+      success: false,
+      error:
+        'Order backend is missing Firebase Admin credentials (FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY). Please configure server environment variables.',
+    });
+  }
+
   const customerUid = verifiedUser.uid;
-  const customerEmail = verifiedUser.email;
-  const customerName = verifiedUser.name || req.body.deliveryAddress?.fullName || 'CookNow Customer';
-  const customerPhone = verifiedUser.phone || req.body.deliveryAddress?.phone || '';
+  const customerName = verifiedUser.name || req.body?.deliveryAddress?.fullName || 'CookNow Customer';
 
   const {
     cookId,
@@ -599,7 +706,7 @@ router.post('/orders/place', async (req: Request, res: Response) => {
   } = req.body || {};
 
   // 2.2 Validate basic payload structure
-  if (!cookId || !Array.isArray(items) || items.length === 0) {
+  if (!cookId || typeof cookId !== 'string' || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({
       success: false,
       error: 'Invalid order request. Missing cook selection or meal items.',
@@ -614,7 +721,7 @@ router.post('/orders/place', async (req: Request, res: Response) => {
     });
   }
 
-  const cleanPhone = phone.trim().replace(/\D/g, '');
+  const cleanPhone = String(phone).trim().replace(/\D/g, '');
   if (!/^[6-9]\d{9}$/.test(cleanPhone)) {
     return res.status(400).json({
       success: false,
@@ -626,29 +733,29 @@ router.post('/orders/place', async (req: Request, res: Response) => {
   if (paymentMethod !== 'cod') {
     return res.status(400).json({
       success: false,
-      error: 'Online UPI payment gateway is in sandbox pilot mode. Please select "Cash / Pay on Delivery" to proceed.',
+      error: 'Online UPI payment gateway is disabled until integrated. Please select "Cash on Delivery" to proceed.',
     });
   }
 
   // 2.4 Idempotency Key validation
-  const cleanIdempotencyKey = (idempotencyKey || '').trim();
-  if (!cleanIdempotencyKey) {
+  const cleanIdempotencyKey = typeof idempotencyKey === 'string' ? idempotencyKey.trim() : '';
+  if (!cleanIdempotencyKey || cleanIdempotencyKey.length > 160 || cleanIdempotencyKey.includes('/')) {
     return res.status(400).json({
       success: false,
-      error: 'idempotencyKey is required to safely place and verify your order.',
+      error: 'A valid idempotencyKey is required to safely place and verify your order.',
     });
   }
 
   // 2.5 Deduplicate & aggregate quantities
   const aggregatedQuantities = new Map<string, number>();
   for (const item of items) {
-    if (!item.menuItemId || typeof item.menuItemId !== 'string') {
+    if (!item?.menuItemId || typeof item.menuItemId !== 'string') {
       return res.status(400).json({ success: false, error: 'Invalid meal item identifier.' });
     }
-    if (!Number.isInteger(item.quantity) || item.quantity <= 0) {
+    if (!Number.isInteger(item.quantity) || item.quantity <= 0 || item.quantity > 50) {
       return res.status(400).json({
         success: false,
-        error: `Invalid quantity (${item.quantity}) for meal item ${item.menuItemId}. Must be a positive integer.`,
+        error: `Invalid quantity (${item.quantity}) for meal item ${item.menuItemId}. Must be an integer between 1 and 50.`,
       });
     }
     aggregatedQuantities.set(
@@ -657,18 +764,20 @@ router.post('/orders/place', async (req: Request, res: Response) => {
     );
   }
 
-  const uniqueItemIds = Array.from(aggregatedQuantities.keys());
-  const cleanPromoCode = (promoCode || '').trim().toUpperCase();
+  const uniqueItemIds = Array.from(aggregatedQuantities.keys()).sort();
+  const cleanPromoCode = typeof promoCode === 'string' ? promoCode.trim().toUpperCase() : '';
 
-  // 2.6 Compute SHA-256 payload signature
+  // 2.6 Compute tamper-evident SHA-256 payload signature
   const payloadSignature = crypto
     .createHash('sha256')
     .update(
       JSON.stringify({
         customerUid,
         cookId,
-        items: uniqueItemIds.sort().map((id) => ({ id, qty: aggregatedQuantities.get(id) })),
+        items: uniqueItemIds.map((id) => ({ id, qty: aggregatedQuantities.get(id) })),
         promoCode: cleanPromoCode,
+        paymentMethod: 'cod',
+        deliveryInstructions: (deliveryInstructions || '').trim(),
         deliveryAddress: {
           fullName: fullName.trim().toLowerCase(),
           phone: cleanPhone,
@@ -679,79 +788,394 @@ router.post('/orders/place', async (req: Request, res: Response) => {
     )
     .digest('hex');
 
-  // 2.7 Idempotency check against Firestore (when Admin SDK active) + memory store
-  let existingIdempotency = IDEMPOTENCY_STORE.get(cleanIdempotencyKey);
-  if (!existingIdempotency && hasAdminCredentials && firestoreDb) {
+  const nowIso = new Date().toISOString();
+  const generatedOrderId = `CN-ORD-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+
+  // 2.7 LIVE FIRESTORE PATH (Server Admin SDK Active)
+  if (hasAdminCredentials && firestoreDb) {
     try {
-      const idemSnap = await firestoreDb
+      // Quick pre-flight idempotency read
+      const existingIdemSnap = await firestoreDb
         .collection('order_idempotency')
         .doc(cleanIdempotencyKey)
         .get();
-      if (idemSnap.exists) {
-        const idemData = idemSnap.data();
+      if (existingIdemSnap.exists) {
+        const idemData = existingIdemSnap.data();
+        if (idemData?.customerId !== customerUid) {
+          return res.status(403).json({
+            success: false,
+            error: 'Cross-customer idempotency key reuse is strictly prohibited.',
+          });
+        }
+        if (idemData?.payloadSignature !== payloadSignature) {
+          return res.status(409).json({
+            success: false,
+            error: 'The provided idempotency key was previously submitted with a different order payload.',
+          });
+        }
         if (idemData?.orderId) {
           const ordSnap = await firestoreDb.collection('orders').doc(idemData.orderId).get();
           if (ordSnap.exists) {
-            existingIdempotency = {
-              customerId: idemData.customerId,
-              payloadSignature: idemData.payloadSignature,
-              order: { id: ordSnap.id, ...ordSnap.data() },
-              createdAt: Date.now(),
-            };
+            return res.json({ success: true, order: { id: ordSnap.id, ...ordSnap.data() } });
           }
         }
       }
-    } catch {
-      // Non-fatal fallback
+
+      // Load platform settings, cook profile, and ordered menu items from Cloud Firestore
+      const [settingsSnap, cookSnap, ...itemSnaps] = await Promise.all([
+        firestoreDb.collection('platform_settings').doc('global').get(),
+        firestoreDb.collection('cooks').doc(cookId).get(),
+        ...uniqueItemIds.map((id) => firestoreDb.collection('menu_items').doc(id).get()),
+      ]);
+
+      if (!cookSnap.exists) {
+        return res.status(400).json({
+          success: false,
+          error: 'Selected kitchen was not found in our verified catalog.',
+        });
+      }
+      const cookData = cookSnap.data();
+      if (!cookData?.isVerified) {
+        return res.status(400).json({
+          success: false,
+          error: 'Selected kitchen is pending verification and cannot receive orders yet.',
+        });
+      }
+      if (cookData.isAcceptingOrders === false) {
+        return res.status(400).json({
+          success: false,
+          error: `"${cookData.kitchenName || 'This kitchen'}" is currently offline and not accepting orders.`,
+        });
+      }
+
+      const activeSettings = settingsSnap.exists
+        ? { ...PLATFORM_SETTINGS, ...settingsSnap.data() }
+        : PLATFORM_SETTINGS;
+
+      let itemsSubtotal = 0;
+      const orderItems: any[] = [];
+
+      for (let idx = 0; idx < uniqueItemIds.length; idx++) {
+        const itemId = uniqueItemIds[idx];
+        const snap = itemSnaps[idx];
+        const quantity = aggregatedQuantities.get(itemId)!;
+
+        if (!snap.exists) {
+          return res.status(400).json({
+            success: false,
+            error: `Menu item "${itemId}" does not exist or has been removed.`,
+          });
+        }
+
+        const itemData = snap.data();
+        if (itemData?.isAvailable === false) {
+          return res.status(400).json({
+            success: false,
+            error: `"${itemData.name || itemId}" is currently sold out.`,
+          });
+        }
+        if (itemData?.cookId && itemData.cookId !== cookId) {
+          return res.status(400).json({
+            success: false,
+            error: 'All items in an order must belong to the same kitchen.',
+          });
+        }
+
+        const canonicalPrice = Number(itemData?.price);
+        if (!Number.isFinite(canonicalPrice) || canonicalPrice <= 0) {
+          return res.status(400).json({
+            success: false,
+            error: `Invalid catalog pricing for "${itemData?.name || itemId}".`,
+          });
+        }
+
+        const subtotal = canonicalPrice * quantity;
+        itemsSubtotal += subtotal;
+
+        orderItems.push({
+          id: `oi-${crypto.randomBytes(4).toString('hex')}`,
+          orderId: generatedOrderId,
+          menuItemId: itemId,
+          itemName: itemData?.name || 'Homestyle Meal',
+          unitPrice: canonicalPrice,
+          quantity,
+          subtotal,
+          dietaryType: itemData?.dietaryType || 'pure_veg',
+        });
+      }
+
+      // Fee calculations preserving approved business settings
+      const deliveryFee =
+        itemsSubtotal >= Number(activeSettings.freeDeliveryThreshold ?? PLATFORM_SETTINGS.freeDeliveryThreshold)
+          ? 0
+          : Number(activeSettings.standardDeliveryFee ?? PLATFORM_SETTINGS.standardDeliveryFee);
+      const platformFee = Number(activeSettings.platformServiceFee ?? PLATFORM_SETTINGS.platformServiceFee);
+      const packagingFee = Number(activeSettings.packagingFee ?? PLATFORM_SETTINGS.packagingFee);
+      const commissionRatePercent = Number(
+        activeSettings.commissionRatePercent ?? PLATFORM_SETTINGS.commissionRatePercent
+      );
+
+      // Look up optional promo document in Firestore promotions collection
+      let promoDocRef: any = null;
+      let promoPreview: any = null;
+      if (cleanPromoCode) {
+        const promoQuerySnap = await firestoreDb
+          .collection('promotions')
+          .where('code', '==', cleanPromoCode)
+          .limit(1)
+          .get();
+        if (promoQuerySnap.empty) {
+          return res.status(400).json({
+            success: false,
+            error: `Coupon "${cleanPromoCode}" is invalid or does not exist.`,
+          });
+        }
+        const docSnap = promoQuerySnap.docs[0];
+        promoDocRef = docSnap.ref;
+        promoPreview = docSnap.data();
+
+        if (!promoPreview?.isActive) {
+          return res.status(400).json({
+            success: false,
+            error: `Coupon "${cleanPromoCode}" is no longer active.`,
+          });
+        }
+        if (itemsSubtotal < Number(promoPreview.minOrderValue || 0)) {
+          return res.status(400).json({
+            success: false,
+            error: `Coupon "${cleanPromoCode}" requires a minimum order subtotal of ₹${promoPreview.minOrderValue}. Your subtotal is ₹${itemsSubtotal}.`,
+          });
+        }
+      }
+
+      // Atomic Firestore transaction for idempotency, promo budget limits, and order creation
+      const txResult = await firestoreDb.runTransaction(async (tx: any) => {
+        const idemRef = firestoreDb.collection('order_idempotency').doc(cleanIdempotencyKey);
+        const idemTxSnap = await tx.get(idemRef);
+        if (idemTxSnap.exists) {
+          const idemData = idemTxSnap.data();
+          if (idemData?.customerId !== customerUid) {
+            throw new HttpRouteError(403, 'Cross-customer idempotency key reuse is strictly prohibited.');
+          }
+          if (idemData?.payloadSignature !== payloadSignature) {
+            throw new HttpRouteError(409, 'The provided idempotency key was previously submitted with a different order payload.');
+          }
+          const existingOrderSnap = await tx.get(firestoreDb.collection('orders').doc(idemData.orderId));
+          if (existingOrderSnap.exists) {
+            return { idempotentHit: true, order: { id: existingOrderSnap.id, ...existingOrderSnap.data() } };
+          }
+        }
+
+        let discount = 0;
+        let appliedPromoCode: string | undefined = undefined;
+        let discountFunding: 'cooknow_funded' | 'restaurant_funded' | 'shared_funded' = 'cooknow_funded';
+        let partnerDiscountShare = 0;
+
+        if (promoDocRef) {
+          const livePromoSnap = await tx.get(promoDocRef);
+          const promo = livePromoSnap.data();
+          if (!promo || !promo.isActive) {
+            throw new HttpRouteError(400, `Coupon "${cleanPromoCode}" is invalid or no longer active.`);
+          }
+          if (itemsSubtotal < Number(promo.minOrderValue || 0)) {
+            throw new HttpRouteError(
+              400,
+              `Coupon "${cleanPromoCode}" requires a minimum order subtotal of ₹${promo.minOrderValue}.`
+            );
+          }
+          if (Number(promo.currentUsageCount || 0) >= Number(promo.usageLimit || 0)) {
+            throw new HttpRouteError(400, `Coupon "${cleanPromoCode}" has reached its maximum global redemption limit.`);
+          }
+
+          discount =
+            promo.discountType === 'percentage'
+              ? Math.round((itemsSubtotal * Number(promo.discountValue)) / 100)
+              : Number(promo.discountValue);
+          discount = Math.min(discount, Number(promo.maxDiscountCap ?? discount), itemsSubtotal);
+
+          if (Number(promo.spentBudget || 0) + discount > Number(promo.budgetLimit || 0)) {
+            throw new HttpRouteError(400, `Coupon "${cleanPromoCode}" has reached its total promotional budget limit.`);
+          }
+
+          if (discount > 0) {
+            appliedPromoCode = cleanPromoCode;
+            discountFunding = promo.fundingSource || 'cooknow_funded';
+            if (discountFunding === 'restaurant_funded') {
+              partnerDiscountShare = discount;
+            } else if (discountFunding === 'shared_funded') {
+              const sharePct = Number(promo.partnerSharePercent ?? 50);
+              partnerDiscountShare = Math.round((discount * sharePct) / 100);
+            }
+
+            tx.update(promoDocRef, {
+              currentUsageCount: Number(promo.currentUsageCount || 0) + 1,
+              spentBudget: Number(promo.spentBudget || 0) + discount,
+            });
+            const redemptionRef = firestoreDb
+              .collection('coupon_redemptions')
+              .doc(`${cleanPromoCode}_${generatedOrderId}`);
+            tx.set(redemptionRef, {
+              code: cleanPromoCode,
+              customerId: customerUid,
+              orderId: generatedOrderId,
+              discountAmount: discount,
+              createdAt: nowIso,
+            });
+          }
+        }
+
+        const finalPayableAmount = Math.max(
+          0,
+          itemsSubtotal + deliveryFee + platformFee + packagingFee - discount
+        );
+        const platformCommission = Math.round((itemsSubtotal * commissionRatePercent) / 100);
+        const cookEarnings = Math.max(0, itemsSubtotal - platformCommission - partnerDiscountShare);
+
+        const canonicalOrder: Record<string, any> = {
+          id: generatedOrderId,
+          orderCode: generatedOrderId,
+          customerId: customerUid,
+          customerName,
+          customerPhone: cleanPhone,
+          cookId,
+          cookUserId: cookData.userId || '',
+          kitchenName: cookData.kitchenName || 'Verified Home Kitchen',
+          status: 'pending',
+          items: orderItems,
+          itemsSubtotal,
+          deliveryFee,
+          platformFee,
+          packagingFee,
+          discount,
+          discountFunding,
+          finalPayableAmount,
+          platformCommission,
+          cookEarnings,
+          paymentMethod: 'cod',
+          paymentStatus: 'pending',
+          deliveryPartnerId: null,
+          deliveryPartnerUserId: null,
+          deliveryStatus: 'unassigned',
+          deliveryAddress: {
+            fullName: fullName.trim(),
+            phone: cleanPhone,
+            locality: locality.trim(),
+            addressLine: addressLine.trim(),
+            landmark: deliveryAddress.landmark?.trim() || '',
+            hostelOrPgName: deliveryAddress.hostelOrPgName?.trim() || '',
+          },
+          deliveryInstructions: (deliveryInstructions || '').trim(),
+          events: [
+            {
+              status: 'pending',
+              timestamp: nowIso,
+              note: 'Order submitted by customer via Cash on Delivery. Awaiting kitchen confirmation.',
+            },
+          ],
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+        if (appliedPromoCode) {
+          canonicalOrder.discountCode = appliedPromoCode;
+        }
+
+        tx.set(firestoreDb.collection('orders').doc(generatedOrderId), canonicalOrder);
+        tx.set(idemRef, {
+          customerId: customerUid,
+          payloadSignature,
+          orderId: generatedOrderId,
+          createdAt: nowIso,
+        });
+
+        return { idempotentHit: false, order: canonicalOrder };
+      });
+
+      LIVE_ORDERS_CACHE.set(txResult.order.id, txResult.order);
+      return res.json({ success: true, order: txResult.order });
+    } catch (err: any) {
+      if (err instanceof HttpRouteError) {
+        return res.status(err.status).json({ success: false, error: err.message });
+      }
+      console.error('[Orders] Firestore transactional order placement error:', {
+        code: err?.code,
+        message: err?.message,
+      });
+      return res.status(500).json({
+        success: false,
+        error: 'Unable to persist order in Cloud Firestore. Please retry.',
+      });
     }
   }
 
-  if (existingIdempotency) {
-    if (existingIdempotency.customerId !== customerUid) {
+  // 2.8 LOCAL TEST / OFFLINE DEV FALLBACK (only reached when !hasAdminCredentials in non-serverless or IS_TEST=true)
+  const existingLocalIdem = IDEMPOTENCY_STORE.get(cleanIdempotencyKey);
+  if (existingLocalIdem) {
+    if (existingLocalIdem.customerId !== customerUid) {
       return res.status(403).json({
         success: false,
         error: 'Cross-customer idempotency key reuse is strictly prohibited.',
       });
     }
-    if (existingIdempotency.payloadSignature !== payloadSignature) {
+    if (existingLocalIdem.payloadSignature !== payloadSignature) {
       return res.status(409).json({
         success: false,
         error: 'The provided idempotency key was previously submitted with a different order payload.',
       });
     }
-    return res.json({ success: true, order: existingIdempotency.order });
+    return res.json({ success: true, order: existingLocalIdem.order });
   }
 
-  // 2.8 Server-Authoritative Price & Availability Lookup
+  const localCook = CANONICAL_COOKS[cookId];
+  if (!localCook) {
+    return res.status(400).json({ success: false, error: 'Selected kitchen was not found.' });
+  }
+  if (!localCook.isVerified || !localCook.isAcceptingOrders) {
+    return res.status(400).json({
+      success: false,
+      error: 'Selected kitchen is pending verification or currently not accepting orders.',
+    });
+  }
+
   let itemsSubtotal = 0;
   const orderItems: any[] = [];
-  const generatedOrderId = `CN-ORD-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
   for (const itemId of uniqueItemIds) {
     const quantity = aggregatedQuantities.get(itemId)!;
     const catalogItem = CANONICAL_MEALS[itemId];
+    if (!catalogItem) {
+      return res.status(400).json({
+        success: false,
+        error: `Menu item "${itemId}" was not found in the approved catalog.`,
+      });
+    }
+    if (!catalogItem.isAvailable) {
+      return res.status(400).json({
+        success: false,
+        error: `"${catalogItem.name}" is currently sold out.`,
+      });
+    }
+    if (catalogItem.cookId !== cookId) {
+      return res.status(400).json({
+        success: false,
+        error: 'All items in an order must belong to the same kitchen.',
+      });
+    }
 
-    // Canonical price lookup (protects against client price tampering)
-    const canonicalPrice = catalogItem ? catalogItem.price : 79.0;
-    const itemName = catalogItem ? catalogItem.name : 'Homestyle Nalapani Meal';
-    const dietaryType = catalogItem ? catalogItem.dietaryType : 'pure_veg';
-
-    const subtotal = canonicalPrice * quantity;
+    const subtotal = catalogItem.price * quantity;
     itemsSubtotal += subtotal;
 
     orderItems.push({
       id: `oi-${crypto.randomBytes(4).toString('hex')}`,
       orderId: generatedOrderId,
       menuItemId: itemId,
-      itemName,
-      unitPrice: canonicalPrice,
+      itemName: catalogItem.name,
+      unitPrice: catalogItem.price,
       quantity,
       subtotal,
-      dietaryType,
+      dietaryType: catalogItem.dietaryType,
     });
   }
 
-  // 2.9 Fee Calculations
   const deliveryFee =
     itemsSubtotal >= PLATFORM_SETTINGS.freeDeliveryThreshold
       ? 0
@@ -759,9 +1183,10 @@ router.post('/orders/place', async (req: Request, res: Response) => {
   const platformFee = PLATFORM_SETTINGS.platformServiceFee;
   const packagingFee = PLATFORM_SETTINGS.packagingFee;
 
-  // 2.10 Coupon Validation & Settlement
   let discount = 0;
   let appliedPromoCode: string | undefined = undefined;
+  let discountFunding: 'cooknow_funded' | 'restaurant_funded' | 'shared_funded' = 'cooknow_funded';
+  let partnerDiscountShare = 0;
 
   if (cleanPromoCode) {
     const promo = CANONICAL_PROMOS[cleanPromoCode];
@@ -771,14 +1196,12 @@ router.post('/orders/place', async (req: Request, res: Response) => {
         error: `Coupon "${cleanPromoCode}" is invalid or no longer active.`,
       });
     }
-
     if (itemsSubtotal < promo.minOrderValue) {
       return res.status(400).json({
         success: false,
         error: `Coupon "${cleanPromoCode}" requires a minimum order subtotal of ₹${promo.minOrderValue}. Your subtotal is ₹${itemsSubtotal}.`,
       });
     }
-
     if (promo.currentUsageCount >= promo.usageLimit) {
       return res.status(400).json({
         success: false,
@@ -786,12 +1209,10 @@ router.post('/orders/place', async (req: Request, res: Response) => {
       });
     }
 
-    if (promo.discountType === 'percentage') {
-      discount = Math.round((itemsSubtotal * promo.discountValue) / 100);
-    } else {
-      discount = promo.discountValue;
-    }
-
+    discount =
+      promo.discountType === 'percentage'
+        ? Math.round((itemsSubtotal * promo.discountValue) / 100)
+        : promo.discountValue;
     discount = Math.min(discount, promo.maxDiscountCap, itemsSubtotal);
 
     if (promo.spentBudget + discount > promo.budgetLimit) {
@@ -803,6 +1224,12 @@ router.post('/orders/place', async (req: Request, res: Response) => {
 
     if (discount > 0) {
       appliedPromoCode = cleanPromoCode;
+      discountFunding = promo.fundingSource;
+      if (discountFunding === 'restaurant_funded') {
+        partnerDiscountShare = discount;
+      } else if (discountFunding === 'shared_funded') {
+        partnerDiscountShare = Math.round((discount * (promo.partnerSharePercent ?? 50)) / 100);
+      }
       promo.currentUsageCount += 1;
       promo.spentBudget += discount;
     }
@@ -815,19 +1242,17 @@ router.post('/orders/place', async (req: Request, res: Response) => {
   const platformCommission = Math.round(
     (itemsSubtotal * PLATFORM_SETTINGS.commissionRatePercent) / 100
   );
-  const cookEarnings = itemsSubtotal - platformCommission;
+  const cookEarnings = Math.max(0, itemsSubtotal - platformCommission - partnerDiscountShare);
 
-  const nowIso = new Date().toISOString();
-
-  // 2.11 Construct Canonical Order Object
-  const canonicalOrder = {
+  const canonicalOrder: Record<string, any> = {
     id: generatedOrderId,
     orderCode: generatedOrderId,
     customerId: customerUid,
     customerName,
     customerPhone: cleanPhone,
     cookId,
-    kitchenName: 'Nalapani Homestyle Kitchen',
+    cookUserId: localCook.userId,
+    kitchenName: localCook.kitchenName,
     status: 'pending',
     items: orderItems,
     itemsSubtotal,
@@ -835,13 +1260,15 @@ router.post('/orders/place', async (req: Request, res: Response) => {
     platformFee,
     packagingFee,
     discount,
-    discountCode: appliedPromoCode,
-    discountFunding: 'cooknow_funded',
+    discountFunding,
     finalPayableAmount,
     platformCommission,
     cookEarnings,
     paymentMethod: 'cod',
     paymentStatus: 'pending',
+    deliveryPartnerId: null,
+    deliveryPartnerUserId: null,
+    deliveryStatus: 'unassigned',
     deliveryAddress: {
       fullName: fullName.trim(),
       phone: cleanPhone,
@@ -851,7 +1278,6 @@ router.post('/orders/place', async (req: Request, res: Response) => {
       hostelOrPgName: deliveryAddress.hostelOrPgName?.trim() || '',
     },
     deliveryInstructions: (deliveryInstructions || '').trim(),
-    deliveryStatus: 'unassigned',
     events: [
       {
         status: 'pending',
@@ -862,70 +1288,27 @@ router.post('/orders/place', async (req: Request, res: Response) => {
     createdAt: nowIso,
     updatedAt: nowIso,
   };
+  if (appliedPromoCode) {
+    canonicalOrder.discountCode = appliedPromoCode;
+  }
 
-  // 2.12 Record to Stores & Caches
   IDEMPOTENCY_STORE.set(cleanIdempotencyKey, {
     customerId: customerUid,
     payloadSignature,
     order: canonicalOrder,
     createdAt: Date.now(),
   });
-
   LIVE_ORDERS_CACHE.set(generatedOrderId, canonicalOrder);
   persistOrders();
-
-  // Sync to Firestore custom database if available
-  if (firestoreDb) {
-    try {
-      await firestoreDb.collection('orders').doc(generatedOrderId).set(canonicalOrder);
-      await firestoreDb.collection('order_idempotency').doc(cleanIdempotencyKey).set({
-        customerId: customerUid,
-        payloadSignature,
-        orderId: generatedOrderId,
-        createdAt: nowIso,
-      });
-    } catch (fsErr) {
-      // Non-fatal if Firestore rules restrict direct admin write without credentials
-    }
-  }
-
-  // Sync to Supabase PostgreSQL if configured
-  const supabase = getSupabaseServerClient();
-  if (supabase) {
-    try {
-      await supabase.from('orders').insert({
-        id: crypto.randomUUID(),
-        order_code: generatedOrderId,
-        customer_id: crypto.randomUUID(), // mapped shadow UUID
-        cook_id: cookId.includes('-') && cookId.length === 36 ? cookId : crypto.randomUUID(),
-        status: 'pending',
-        items_subtotal: itemsSubtotal,
-        delivery_fee: deliveryFee,
-        platform_fee: platformFee,
-        packaging_fee: packagingFee,
-        discount,
-        discount_code: appliedPromoCode,
-        final_payable_amount: finalPayableAmount,
-        platform_commission: platformCommission,
-        cook_earnings: cookEarnings,
-        payment_method: 'cod',
-        payment_status: 'pending',
-        delivery_address: canonicalOrder.deliveryAddress,
-        delivery_instructions: deliveryInstructions || null,
-      });
-    } catch (sbErr) {
-      // Non-fatal if tables not yet created
-    }
-  }
 
   return res.json({
     success: true,
     order: canonicalOrder,
   });
-});
+}));
 
 // 3. Customer's Own Orders Endpoint (Strictly Customer-Scoped)
-router.get('/orders/my-orders', async (req: Request, res: Response) => {
+router.get('/orders/my-orders', asyncHandler(async (req: Request, res: Response) => {
   const verifiedUser = await extractVerifiedUser(req);
   if (!verifiedUser) {
     return res.status(401).json({ success: false, error: 'Authentication required.' });
@@ -939,40 +1322,113 @@ router.get('/orders/my-orders', async (req: Request, res: Response) => {
   );
 
   return res.json({ success: true, orders: customerOrders });
-});
+}));
 
-// 4. Cook's Kitchen Orders Endpoint (Cook-Scoped)
-router.get('/orders/kitchen-orders', async (req: Request, res: Response) => {
+// 4. Cook's Kitchen Orders Endpoint (Cook-Scoped with Server Ownership Verification)
+router.get('/orders/kitchen-orders', asyncHandler(async (req: Request, res: Response) => {
   const verifiedUser = await extractVerifiedUser(req);
   if (!verifiedUser) {
     return res.status(401).json({ success: false, error: 'Authentication required.' });
   }
 
-  const cookId = (req.query.cookId as string) || '';
+  const isOwner = verifiedUser.email === OWNER_EMAIL.toLowerCase() && verifiedUser.emailVerified;
+  const requestedCookId = ((req.query.cookId as string) || '').trim();
+
+  let authorizedCookIds: string[] = [];
+  if (!isOwner) {
+    if (hasAdminCredentials && firestoreDb) {
+      const cooksSnap = await firestoreDb
+        .collection('cooks')
+        .where('userId', '==', verifiedUser.uid)
+        .get();
+      authorizedCookIds = cooksSnap.docs.map((d: any) => d.id);
+    } else if (process.env.NODE_ENV === 'test' && process.env.IS_TEST === 'true') {
+      authorizedCookIds = Object.values(CANONICAL_COOKS)
+        .filter((c) => c.userId === verifiedUser.uid)
+        .map((c) => c.id);
+    }
+    if (authorizedCookIds.length === 0) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. Authenticated user does not own a verified kitchen profile.',
+      });
+    }
+    if (requestedCookId && !authorizedCookIds.includes(requestedCookId)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. You may only inspect orders belonging to your own kitchen.',
+      });
+    }
+  }
+
   const allOrders = await fetchOrdersFromFirestoreOrCache();
-  const kitchenOrders = allOrders.filter((order) => !cookId || order.cookId === cookId);
+  const kitchenOrders = allOrders.filter((order) => {
+    if (isOwner) return !requestedCookId || order.cookId === requestedCookId;
+    return requestedCookId
+      ? order.cookId === requestedCookId
+      : authorizedCookIds.includes(order.cookId) || order.cookUserId === verifiedUser.uid;
+  });
 
   return res.json({ success: true, orders: kitchenOrders });
-});
+}));
 
-// 5. Delivery Partner Assigned Orders Endpoint (Rider-Scoped)
-router.get('/orders/rider-orders', async (req: Request, res: Response) => {
+// 5. Delivery Partner Assigned Orders Endpoint (Rider-Scoped with Server Verification)
+router.get('/orders/rider-orders', asyncHandler(async (req: Request, res: Response) => {
   const verifiedUser = await extractVerifiedUser(req);
   if (!verifiedUser) {
     return res.status(401).json({ success: false, error: 'Authentication required.' });
   }
 
-  const riderId = (req.query.riderId as string) || '';
+  const isOwner = verifiedUser.email === OWNER_EMAIL.toLowerCase() && verifiedUser.emailVerified;
+  const requestedRiderId = ((req.query.riderId as string) || '').trim();
+
+  let authorizedRiderIds: string[] = [];
+  if (!isOwner) {
+    if (hasAdminCredentials && firestoreDb) {
+      const riderSnap = await firestoreDb
+        .collection('delivery_partners')
+        .where('userId', '==', verifiedUser.uid)
+        .where('status', '==', 'approved')
+        .get();
+      authorizedRiderIds = riderSnap.docs.map((d: any) => d.id);
+    } else if (
+      process.env.NODE_ENV === 'test' &&
+      process.env.IS_TEST === 'true' &&
+      verifiedUser.uid === 'user-rider-1'
+    ) {
+      authorizedRiderIds = ['dp-1'];
+    }
+    if (authorizedRiderIds.length === 0) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. Only approved delivery partners or the Owner can view courier dispatches.',
+      });
+    }
+    if (requestedRiderId && !authorizedRiderIds.includes(requestedRiderId)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. You may only inspect your own assigned deliveries.',
+      });
+    }
+  }
+
   const allOrders = await fetchOrdersFromFirestoreOrCache();
-  const riderOrders = allOrders.filter(
-    (order) => (!riderId && order.status === 'ready') || order.deliveryPartnerId === riderId
-  );
+  const riderOrders = allOrders.filter((order) => {
+    if (isOwner) {
+      return (!requestedRiderId && order.status === 'ready') || order.deliveryPartnerId === requestedRiderId;
+    }
+    const assignedToMe =
+      authorizedRiderIds.includes(order.deliveryPartnerId) ||
+      order.deliveryPartnerUserId === verifiedUser.uid;
+    const unassignedReady = order.status === 'ready' && !order.deliveryPartnerId;
+    return assignedToMe || unassignedReady;
+  });
 
   return res.json({ success: true, orders: riderOrders });
-});
+}));
 
 // 6. Admin All Orders Endpoint (Strictly Restricted to Owner)
-router.get('/orders/admin-all', async (req: Request, res: Response) => {
+router.get('/orders/admin-all', asyncHandler(async (req: Request, res: Response) => {
   const verifiedUser = await extractVerifiedUser(req);
   if (!verifiedUser) {
     return res.status(401).json({ success: false, error: 'Authentication required.' });
@@ -991,10 +1447,10 @@ router.get('/orders/admin-all', async (req: Request, res: Response) => {
   );
 
   return res.json({ success: true, orders: allOrders });
-});
+}));
 
-// 7. Order Status Update Endpoint (Role-Authorized)
-router.patch('/orders/:orderId/status', async (req: Request, res: Response) => {
+// 7. Order Status Update Endpoint (Role-Authorized & Lifecycle Validated)
+router.patch('/orders/:orderId/status', asyncHandler(async (req: Request, res: Response) => {
   const verifiedUser = await extractVerifiedUser(req);
   if (!verifiedUser) {
     return res.status(401).json({ success: false, error: 'Authentication required.' });
@@ -1003,26 +1459,84 @@ router.patch('/orders/:orderId/status', async (req: Request, res: Response) => {
   const { orderId } = req.params;
   const { status, cancellationReason, partnerId, partnerName } = req.body || {};
 
-  const order = LIVE_ORDERS_CACHE.get(orderId);
+  if (!status || !Object.prototype.hasOwnProperty.call(ALLOWED_ORDER_TRANSITIONS, status)) {
+    return res.status(400).json({ success: false, error: `Invalid order status: "${status}".` });
+  }
+
+  const order = await fetchSingleOrder(orderId);
   if (!order) {
     return res.status(404).json({ success: false, error: 'Order not found.' });
+  }
+
+  // Validate state machine transition
+  const allowedNext = ALLOWED_ORDER_TRANSITIONS[order.status] || [];
+  if (!allowedNext.includes(status)) {
+    return res.status(400).json({
+      success: false,
+      error: `Invalid status transition from "${order.status}" to "${status}".`,
+    });
   }
 
   const isOwner =
     verifiedUser.email === OWNER_EMAIL.toLowerCase() && verifiedUser.emailVerified;
   const isCustomer = order.customerId === verifiedUser.uid;
+  const isCook = order.cookUserId === verifiedUser.uid;
+  let isRider = order.deliveryPartnerUserId === verifiedUser.uid;
 
-  // Authorization checks
-  if (status === 'cancelled') {
-    // Only customer (if pending) or owner can cancel
-    if (!isOwner && !isCustomer) {
-      return res.status(403).json({ success: false, error: 'Unauthorized to cancel this order.' });
+  if (!isOwner && !isRider && (status === 'out_for_delivery' || status === 'delivered')) {
+    if (hasAdminCredentials && firestoreDb) {
+      const riderSnap = await firestoreDb
+        .collection('delivery_partners')
+        .where('userId', '==', verifiedUser.uid)
+        .where('status', '==', 'approved')
+        .limit(1)
+        .get();
+      if (!riderSnap.empty && (!order.deliveryPartnerUserId || order.deliveryPartnerUserId === verifiedUser.uid)) {
+        isRider = true;
+      }
+    } else if (
+      process.env.NODE_ENV === 'test' &&
+      process.env.IS_TEST === 'true' &&
+      verifiedUser.uid === 'user-rider-1'
+    ) {
+      isRider = true;
     }
-    if (isCustomer && !['pending', 'accepted'].includes(order.status)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Order cannot be cancelled once cooking or delivery has commenced.',
-      });
+  }
+
+  // Strict Role Authorization Check
+  if (!isOwner) {
+    if (status === 'cancelled') {
+      if (isCustomer) {
+        if (order.status !== 'pending') {
+          return res.status(400).json({
+            success: false,
+            error: 'Customers can only cancel orders while still pending kitchen acceptance.',
+          });
+        }
+      } else if (isCook) {
+        if (order.status !== 'pending') {
+          return res.status(400).json({
+            success: false,
+            error: 'Kitchens can only reject/cancel orders before preparation begins.',
+          });
+        }
+      } else {
+        return res.status(403).json({ success: false, error: 'Unauthorized to cancel this order.' });
+      }
+    } else if (['accepted', 'preparing', 'ready'].includes(status)) {
+      if (!isCook) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only the assigned kitchen or Owner can advance kitchen preparation states.',
+        });
+      }
+    } else if (['out_for_delivery', 'delivered'].includes(status)) {
+      if (!isRider && !(status === 'out_for_delivery' && isCook)) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only an approved delivery partner or Owner can update dispatch/delivery completion.',
+        });
+      }
     }
   }
 
@@ -1039,25 +1553,52 @@ router.patch('/orders/:orderId/status', async (req: Request, res: Response) => {
   if (partnerName) {
     order.deliveryPartnerName = partnerName;
   }
+  if (status === 'out_for_delivery') {
+    order.deliveryStatus = 'out_for_delivery';
+    if (isRider && !order.deliveryPartnerUserId) {
+      order.deliveryPartnerUserId = verifiedUser.uid;
+    }
+  } else if (status === 'delivered') {
+    order.deliveryStatus = 'delivered';
+  }
 
+  if (!Array.isArray(order.events)) {
+    order.events = [];
+  }
   order.events.push({
     status,
     timestamp: nowIso,
     note: `Status updated to ${status}${cancellationReason ? ` (${cancellationReason})` : ''}`,
   });
 
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      await firestoreDb.collection('orders').doc(orderId).set(order, { merge: true });
+    } catch (fsErr: any) {
+      console.error('[Orders] Failed updating order status in Firestore:', {
+        orderId,
+        code: fsErr?.code,
+        message: fsErr?.message,
+      });
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to update order status in Cloud Firestore.',
+      });
+    }
+  }
+
   LIVE_ORDERS_CACHE.set(orderId, order);
   persistOrders();
   return res.json({ success: true, order });
-});
+}));
 
 // 8. Explicit COD Remittance Confirmation Endpoint (Founder/Owner Reconciled)
-router.patch('/orders/:orderId/confirm-cod', async (req: Request, res: Response) => {
+router.patch('/orders/:orderId/confirm-cod', asyncHandler(async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
   const { orderId } = req.params;
-  const order = LIVE_ORDERS_CACHE.get(orderId);
+  const order = await fetchSingleOrder(orderId);
   if (!order) {
     return res.status(404).json({ success: false, error: 'Order not found.' });
   }
@@ -1076,29 +1617,48 @@ router.patch('/orders/:orderId/confirm-cod', async (req: Request, res: Response)
   order.reconciledBy = 'Vivek Singh Negi (Founder & Owner)';
   order.updatedAt = nowIso;
 
+  if (!Array.isArray(order.events)) {
+    order.events = [];
+  }
   order.events.push({
     status: order.status,
     timestamp: nowIso,
     note: 'COD cash remittance confirmed and reconciled at Nalapani Hub by Vivek Singh Negi',
   });
 
-  LIVE_ORDERS_CACHE.set(orderId, order);
-  persistOrders();
-
-  if (firestoreDb) {
+  if (hasAdminCredentials && firestoreDb) {
     try {
       await firestoreDb.collection('orders').doc(orderId).set(order, { merge: true });
-    } catch {
-      // Non-fatal fallback
+      await firestoreDb.collection('audit_logs').doc(`cod_${orderId}_${Date.now()}`).set({
+        action: 'CONFIRM_COD_REMITTANCE',
+        targetType: 'order',
+        targetId: orderId,
+        amount: order.finalPayableAmount,
+        actorEmail: verifiedOwner.email,
+        createdAt: nowIso,
+      });
+    } catch (fsErr: any) {
+      console.error('[COD] Failed persisting COD remittance to Firestore:', {
+        orderId,
+        code: fsErr?.code,
+        message: fsErr?.message,
+      });
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to persist COD remittance in Cloud Firestore.',
+      });
     }
   }
+
+  LIVE_ORDERS_CACHE.set(orderId, order);
+  persistOrders();
 
   return res.json({
     success: true,
     order,
     message: `COD cash remittance of ₹${order.finalPayableAmount} reconciled and verified successfully.`,
   });
-});
+}));
 
 // ------------------------------------------------------------------------------
 // OWNER COMMAND CENTER & REAL-TIME BUSINESS INTELLIGENCE ENDPOINTS (Phase 10)
@@ -1144,13 +1704,16 @@ async function requireVerifiedOwner(req: Request, res: Response): Promise<Verifi
 }
 
 // 8. Owner Real-Time Analytics & Financial Metrics
-router.get('/owner/analytics', async (req: Request, res: Response) => {
+router.get('/owner/analytics', asyncHandler(async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
   const timeRange = ((req.query.timeRange as string) || '30d').toLowerCase();
-  const allOrders = await fetchOrdersFromFirestoreOrCache();
-  const allExpenses = await fetchExpensesFromFirestoreOrCache();
+  const [allOrders, allExpenses, allSettlements] = await Promise.all([
+    fetchOrdersFromFirestoreOrCache(),
+    fetchExpensesFromFirestoreOrCache(),
+    fetchSettlementsFromFirestoreOrCache(),
+  ]);
 
   const now = new Date();
   const nowMs = now.getTime();
@@ -1247,8 +1810,8 @@ router.get('/owner/analytics', async (req: Request, res: Response) => {
 
   // Liabilities Calculation (Total payouts due minus marked settlements)
   let totalSettledAmount = 0;
-  for (const s of LIVE_SETTLEMENTS_CACHE.values()) {
-    totalSettledAmount += (s.amount || 0);
+  for (const s of allSettlements) {
+    totalSettledAmount += s.amount || 0;
   }
   const totalCooksOwed = cookRestaurantPayouts;
   const totalRidersOwed = deliveryExpenses;
@@ -1430,19 +1993,19 @@ router.get('/owner/analytics', async (req: Request, res: Response) => {
     healthIndicators,
     founderOverview,
   });
-});
+}));
 
 // 9. Operating Expenses CRUD Endpoints
-router.get('/owner/expenses', async (req: Request, res: Response) => {
+router.get('/owner/expenses', asyncHandler(async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
   const expenses = await fetchExpensesFromFirestoreOrCache();
   expenses.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   return res.json({ success: true, expenses });
-});
+}));
 
-router.post('/owner/expenses', async (req: Request, res: Response) => {
+router.post('/owner/expenses', asyncHandler(async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
@@ -1454,15 +2017,16 @@ router.post('/owner/expenses', async (req: Request, res: Response) => {
     });
   }
 
-  // Duplicate expense detection: Prevent double-click duplicates within 5 minutes
+  // Duplicate expense detection across Firestore & cache within 5 minutes
+  const currentExpenses = await fetchExpensesFromFirestoreOrCache();
   const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
-  const duplicate = Array.from(LIVE_EXPENSES_CACHE.values()).find((exp) => {
+  const duplicate = currentExpenses.find((exp) => {
     if (exp.isReversed) return false;
     const expTime = exp.createdAt ? new Date(exp.createdAt).getTime() : 0;
     return (
       exp.category === category &&
       exp.amount === Number(amount) &&
-      exp.description.toLowerCase().trim() === description.toLowerCase().trim() &&
+      (exp.description || '').toLowerCase().trim() === description.toLowerCase().trim() &&
       expTime > fiveMinutesAgo
     );
   });
@@ -1487,28 +2051,24 @@ router.post('/owner/expenses', async (req: Request, res: Response) => {
     isReversed: false,
   };
 
+  if (hasAdminCredentials && firestoreDb) {
+    await firestoreDb.collection('operating_expenses').doc(newExpense.id).set(newExpense);
+  }
+
   LIVE_EXPENSES_CACHE.set(newExpense.id, newExpense);
   persistExpenses();
 
-  if (firestoreDb) {
-    try {
-      await firestoreDb.collection('operating_expenses').doc(newExpense.id).set(newExpense);
-    } catch {
-      // Non-fatal fallback
-    }
-  }
-
   return res.json({ success: true, expense: newExpense });
-});
+}));
 
-// Explicit Reversal Endpoint for Operating Expenses
-router.post('/owner/expenses/:id/reverse', async (req: Request, res: Response) => {
+// Explicit Reversal Endpoint for Operating Expenses (Soft Reversal Only)
+router.post('/owner/expenses/:id/reverse', asyncHandler(async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
   const { id } = req.params;
   const { reason } = req.body || {};
-  const expense = LIVE_EXPENSES_CACHE.get(id);
+  const expense = await fetchSingleExpense(id);
   if (!expense) {
     return res.status(404).json({ success: false, error: 'Expense record not found.' });
   }
@@ -1523,32 +2083,45 @@ router.post('/owner/expenses/:id/reverse', async (req: Request, res: Response) =
   expense.reversedBy = 'Vivek Singh Negi (Founder & Owner)';
   expense.reversalReason = (reason || 'Owner financial correction').trim();
 
+  if (hasAdminCredentials && firestoreDb) {
+    await firestoreDb.collection('operating_expenses').doc(id).set(expense, { merge: true });
+    await firestoreDb.collection('audit_logs').doc(`exp_rev_${id}_${Date.now()}`).set({
+      action: 'REVERSE_OPERATING_EXPENSE',
+      targetType: 'operating_expense',
+      targetId: id,
+      reason: expense.reversalReason,
+      actorEmail: verifiedOwner.email,
+      createdAt: nowIso,
+    });
+  }
+
   LIVE_EXPENSES_CACHE.set(id, expense);
   persistExpenses();
-
-  if (firestoreDb) {
-    try {
-      await firestoreDb.collection('operating_expenses').doc(id).set(expense, { merge: true });
-    } catch {
-      // Non-fatal fallback
-    }
-  }
 
   return res.json({
     success: true,
     expense,
     message: 'Expense successfully reversed with immutable audit trail preserved.',
   });
-});
+}));
 
-router.delete('/owner/expenses/:id', async (req: Request, res: Response) => {
+router.delete('/owner/expenses/:id', asyncHandler(async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
   const { id } = req.params;
-  const expense = LIVE_EXPENSES_CACHE.get(id);
+  const expense = await fetchSingleExpense(id);
   if (!expense) {
     return res.status(404).json({ success: false, error: 'Expense record not found.' });
+  }
+
+  if (expense.isReversed) {
+    return res.json({
+      success: true,
+      id,
+      expense,
+      message: 'Expense is already soft-reversed.',
+    });
   }
 
   const nowIso = new Date().toISOString();
@@ -1557,16 +2130,20 @@ router.delete('/owner/expenses/:id', async (req: Request, res: Response) => {
   expense.reversedBy = 'Vivek Singh Negi (Founder & Owner)';
   expense.reversalReason = (req.body?.reason || 'Owner administrative reversal').trim();
 
+  if (hasAdminCredentials && firestoreDb) {
+    await firestoreDb.collection('operating_expenses').doc(id).set(expense, { merge: true });
+    await firestoreDb.collection('audit_logs').doc(`exp_rev_${id}_${Date.now()}`).set({
+      action: 'REVERSE_OPERATING_EXPENSE',
+      targetType: 'operating_expense',
+      targetId: id,
+      reason: expense.reversalReason,
+      actorEmail: verifiedOwner.email,
+      createdAt: nowIso,
+    });
+  }
+
   LIVE_EXPENSES_CACHE.set(id, expense);
   persistExpenses();
-
-  if (firestoreDb) {
-    try {
-      await firestoreDb.collection('operating_expenses').doc(id).set(expense, { merge: true });
-    } catch {
-      // Non-fatal
-    }
-  }
 
   return res.json({
     success: true,
@@ -1574,10 +2151,10 @@ router.delete('/owner/expenses/:id', async (req: Request, res: Response) => {
     expense,
     message: 'Expense soft-reversed to preserve financial audit trail.',
   });
-});
+}));
 
 // 10. Settlements Management Endpoints (Cook & Rider Payouts)
-router.get('/owner/settlements', async (req: Request, res: Response) => {
+router.get('/owner/settlements', asyncHandler(async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
@@ -1621,9 +2198,9 @@ router.get('/owner/settlements', async (req: Request, res: Response) => {
     riderSettlements: Array.from(riderMap.values()),
     settlementHistory,
   });
-});
+}));
 
-router.post('/owner/settlements/mark-paid', async (req: Request, res: Response) => {
+router.post('/owner/settlements/mark-paid', asyncHandler(async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
@@ -1632,6 +2209,7 @@ router.post('/owner/settlements/mark-paid', async (req: Request, res: Response) 
     return res.status(400).json({ success: false, error: 'Invalid settlement payload.' });
   }
 
+  const nowIso = new Date().toISOString();
   const settlementRecord = {
     id: `settle-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
     targetType,
@@ -1639,26 +2217,42 @@ router.post('/owner/settlements/mark-paid', async (req: Request, res: Response) 
     targetName: targetName || 'Partner',
     amount: Number(amount),
     referenceNumber: referenceNumber || `UPI-TXN-${Date.now()}`,
-    settledAt: new Date().toISOString(),
+    settledAt: nowIso,
     settledBy: 'Vivek Singh Negi',
   };
+
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      await firestoreDb.collection('settlements').doc(settlementRecord.id).set(settlementRecord);
+      await firestoreDb.collection('audit_logs').doc(`settle_${settlementRecord.id}`).set({
+        action: 'MARK_PARTNER_SETTLEMENT_PAID',
+        targetType,
+        targetId,
+        amount: settlementRecord.amount,
+        actorEmail: verifiedOwner.email,
+        createdAt: nowIso,
+      });
+    } catch (fsErr: any) {
+      console.error('[Settlements] Failed persisting settlement to Firestore:', {
+        id: settlementRecord.id,
+        code: fsErr?.code,
+        message: fsErr?.message,
+      });
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to persist settlement record in Cloud Firestore.',
+      });
+    }
+  }
 
   LIVE_SETTLEMENTS_CACHE.set(settlementRecord.id, settlementRecord);
   persistSettlements();
 
-  if (firestoreDb) {
-    try {
-      await firestoreDb.collection('settlements').doc(settlementRecord.id).set(settlementRecord);
-    } catch {
-      // Non-fatal
-    }
-  }
-
   return res.json({ success: true, settlement: settlementRecord });
-});
+}));
 
 // 11. Formatted CSV Export Endpoint
-router.get('/owner/export-csv', async (req: Request, res: Response) => {
+router.get('/owner/export-csv', asyncHandler(async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
@@ -1722,7 +2316,7 @@ router.get('/owner/export-csv', async (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="cooknow_ledger_${Date.now()}.csv"`);
   return res.send(csvContent);
-});
+}));
 
 // 12. Public Client Configuration Endpoint
 router.get('/config/public-client', (_req: Request, res: Response) => {
@@ -1775,9 +2369,8 @@ router.get('/config/public-client', (_req: Request, res: Response) => {
       anonKey: supabaseAnonKey,
       isValidConfig,
       isPublishableKeyInUrl,
-      diagnosticMessage: isValidConfig
-        ? 'Supabase configuration format is valid.'
-        : 'Supabase configuration requires verification in Dashboard.',
+      optionalStandby: true,
+      diagnosticMessage: 'Supabase is configured as Optional Standby only. Cloud Firestore is the active Primary Database.',
     },
   });
 });
@@ -1863,30 +2456,25 @@ async function diagnoseSupabaseConnection(rawUrl: string, rawKey: string) {
   };
 }
 
-router.post('/config/test-supabase', async (req: Request, res: Response) => {
-  const { url, anonKey } = req.body || {};
-  const result = await diagnoseSupabaseConnection(
-    url || process.env.VITE_SUPABASE_URL || '',
-    anonKey || process.env.VITE_SUPABASE_ANON_KEY || ''
-  );
-  return res.json(result);
-});
+router.post('/config/test-supabase', asyncHandler(async (_req: Request, res: Response) => {
+  return res.json({
+    connected: false,
+    optionalStandby: true,
+    stage: 'standby',
+    code: 'STANDBY_INACTIVE',
+    message:
+      'Supabase PostgreSQL is Optional / Standby / Not Required. Cloud Firestore (cooknow-9444c) is the Primary Database.',
+  });
+}));
 
-router.post('/config/supabase', async (req: Request, res: Response) => {
-  let { url, anonKey } = req.body || {};
-  url = (url || '').trim();
-  anonKey = (anonKey || '').trim() || process.env.VITE_SUPABASE_ANON_KEY || '';
-
-  if (!url || !anonKey) {
-    return res.status(400).json({ success: false, error: 'URL and Anon Key are required.' });
-  }
-
-  process.env.VITE_SUPABASE_URL = url;
-  process.env.VITE_SUPABASE_ANON_KEY = anonKey;
-
-  const diag = await diagnoseSupabaseConnection(url, anonKey);
-  return res.json({ success: true, saved: true, url, anonKey, ...diag });
-});
+router.post('/config/supabase', asyncHandler(async (_req: Request, res: Response) => {
+  return res.status(410).json({
+    success: false,
+    optionalStandby: true,
+    error:
+      'Supabase runtime configuration is disabled. Cloud Firestore (cooknow-9444c) is the active Single Source of Truth.',
+  });
+}));
 
 // ------------------------------------------------------------------------------
 // SERVER INITIALIZATION & LIFECYCLE
@@ -1908,6 +2496,31 @@ app.get('/api', (_req: Request, res: Response) => {
 
 app.use('/api', router);
 app.use('/', router);
+
+// Catch unknown /api routes with JSON instead of HTML
+app.use('/api', (_req: Request, res: Response) => {
+  return res.status(404).json({
+    success: false,
+    error: 'Requested API route was not found.',
+  });
+});
+
+// Global Express JSON error handler (prevents raw HTML 500 pages on uncaught exceptions)
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  const status =
+    typeof err?.status === 'number' && err.status >= 400 && err.status < 600 ? err.status : 500;
+  console.error('[API Error Handler]', {
+    status,
+    code: err?.code || 'INTERNAL_ERROR',
+    message: err?.message || 'Unexpected error',
+  });
+  if (!res.headersSent) {
+    res.status(status).json({
+      success: false,
+      error: status >= 500 ? 'Internal server error. Please retry.' : err?.message || 'Request failed.',
+    });
+  }
+});
 
 export { app, router, hasAdminCredentials };
 export default app;

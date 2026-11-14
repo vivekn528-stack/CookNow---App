@@ -3,13 +3,14 @@ process.env.IS_TEST = 'true';
 
 import crypto from 'node:crypto';
 import http from 'node:http';
+import fs from 'node:fs';
+import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import app from '../server';
 
 const TEST_PORT = 3999;
 let server: http.Server;
 const BASE_URL = `http://localhost:${TEST_PORT}`;
 
-// Helper for making HTTP requests to the test server
 async function apiRequest(
   path: string,
   options: {
@@ -31,23 +32,92 @@ async function apiRequest(
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
 
-  const data = await res.json().catch(() => null);
-  return { status: res.status, ok: res.ok, data };
+  const text = await res.text();
+  let data: any = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+  return { status: res.status, ok: res.ok, data, rawText: text, contentType: res.headers.get('content-type') || '' };
 }
 
 async function runTestSuite() {
   console.log('================================================================');
-  console.log('   COOKNOW MARKETPLACE - PRODUCTION INTEGRATION TEST SUITE      ');
+  console.log('   COOKNOW MARKETPLACE - BACKEND & ORDER WORKFLOW TEST SUITE    ');
   console.log('   Location: Nalapani Chowk, Dehradun, Uttarakhand              ');
-  console.log('   Architecture: Firebase Spark ($0.00) + Supabase PostgreSQL   ');
+  console.log('   Primary DB: Cloud Firestore (cooknow-9444c)                  ');
   console.log('================================================================\n');
+
+  // Generate ephemeral RS256 keypair strictly inside test process for real jose jwtVerify testing
+  const { publicKey, privateKey } = await generateKeyPair('RS256');
+  const publicJwk = await exportJWK(publicKey);
+  publicJwk.kid = 'cooknow-test-kid-1';
+  publicJwk.alg = 'RS256';
+  publicJwk.use = 'sig';
+  process.env.COOKNOW_TEST_PUBLIC_JWK = JSON.stringify(publicJwk);
+
+  async function mintTestJwt(claims: {
+    sub: string;
+    email: string;
+    email_verified?: boolean;
+    name?: string;
+  }) {
+    return await new SignJWT({
+      email: claims.email,
+      email_verified: claims.email_verified ?? true,
+      name: claims.name || 'Test User',
+      auth_time: Math.floor(Date.now() / 1000),
+    })
+      .setProtectedHeader({ alg: 'RS256', kid: 'cooknow-test-kid-1' })
+      .setIssuer('https://securetoken.google.com/cooknow-9444c')
+      .setAudience('cooknow-9444c')
+      .setSubject(claims.sub)
+      .setIssuedAt()
+      .setExpirationTime('1h')
+      .sign(privateKey);
+  }
+
+  const customerToken = await mintTestJwt({
+    sub: 'test-cust-101',
+    email: 'student.nalapani@example.com',
+    name: 'Aarav Rawat',
+  });
+  const secondCustomerToken = await mintTestJwt({
+    sub: 'test-cust-202',
+    email: 'other.student@example.com',
+    name: 'Riya Bisht',
+  });
+  const cookToken = await mintTestJwt({
+    sub: 'user-cook-1',
+    email: 'sunita.rasoi@example.com',
+    name: 'Sunita Rawat',
+  });
+  const riderToken = await mintTestJwt({
+    sub: 'user-rider-1',
+    email: 'suresh.rider@example.com',
+    name: 'Suresh Semwal',
+  });
+  const ownerToken = await mintTestJwt({
+    sub: 'owner-vivek-uid',
+    email: 'vivekn528@gmail.com',
+    email_verified: true,
+    name: 'Vivek Singh Negi',
+  });
+  const unverifiedOwnerToken = await mintTestJwt({
+    sub: 'fake-owner-uid',
+    email: 'vivekn528@gmail.com',
+    email_verified: false,
+    name: 'Unverified Attacker',
+  });
 
   // Start isolated test server
   server = app.listen(TEST_PORT);
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await new Promise((resolve) => setTimeout(resolve, 400));
 
   let passedTests = 0;
   let totalTests = 0;
+  const failures: string[] = [];
 
   function recordResult(name: string, passed: boolean, details?: string) {
     totalTests++;
@@ -55,346 +125,546 @@ async function runTestSuite() {
       passedTests++;
       console.log(`  [PASS] ${name}`);
     } else {
+      failures.push(`${name}${details ? `: ${details}` : ''}`);
       console.error(`  [FAIL] ${name}${details ? ` -> ${details}` : ''}`);
     }
   }
 
   try {
     // --------------------------------------------------------------------------
-    // TEST GROUP 1: PUBLIC HEALTH & CLIENT CONFIGURATION
+    // TEST GROUP 1: VERCEL REWRITE ROUTING, HEALTH & CLIENT CONFIG
     // --------------------------------------------------------------------------
-    console.log('>>> TEST GROUP 1: Public Configuration & Health Endpoints');
-
-    const configRes = await apiRequest('/api/config/public-client');
-    recordResult(
-      'GET /api/config/public-client returns valid structure',
-      configRes.status === 200 && configRes.data?.firebase?.projectId === 'cooknow-9444c'
-    );
-    recordResult(
-      'Client configuration does not leak service-role secret',
-      !configRes.data?.supabase?.serviceRoleKey && !JSON.stringify(configRes.data).includes('service_role')
-    );
-
-    // --------------------------------------------------------------------------
-    // TEST GROUP 2: AUTHENTICATION & TOKEN VERIFICATION GATES
-    // --------------------------------------------------------------------------
-    console.log('\n>>> TEST GROUP 2: Authentication & JWKS Verification Gates');
-
-    const noTokenRes = await apiRequest('/api/auth/verify-owner', { method: 'POST' });
-    recordResult(
-      'Missing Bearer token rejected with HTTP 401',
-      noTokenRes.status === 401 && noTokenRes.data?.verified === false
-    );
-
-    const malformedTokenRes = await apiRequest('/api/auth/verify-owner', {
-      method: 'POST',
-      token: 'fake.malformed.jwt.token',
-    });
-    recordResult(
-      'Forged/Malformed token cryptographically rejected with HTTP 401',
-      malformedTokenRes.status === 401 && malformedTokenRes.data?.verified === false
-    );
-
-    const placeOrderNoAuth = await apiRequest('/api/orders/place', {
-      method: 'POST',
-      body: { cookId: 'cook-meenakshi', items: [] },
-    });
-    recordResult(
-      'Order placement without authentication rejected with HTTP 401',
-      placeOrderNoAuth.status === 401
-    );
-
-    const myOrdersNoAuth = await apiRequest('/api/orders/my-orders');
-    recordResult(
-      'Customer order history access without authentication rejected with HTTP 401',
-      myOrdersNoAuth.status === 401
-    );
-
-    const adminOrdersNoAuth = await apiRequest('/api/orders/admin-all');
-    recordResult(
-      'Owner dashboard order access without authentication rejected with HTTP 401',
-      adminOrdersNoAuth.status === 401
-    );
-
-    const ownerAnalyticsNoAuth = await apiRequest('/api/owner/analytics');
-    recordResult(
-      'Owner analytics endpoint without authentication rejected with HTTP 401',
-      ownerAnalyticsNoAuth.status === 401
-    );
-
-    const ownerExpensesNoAuth = await apiRequest('/api/owner/expenses');
-    recordResult(
-      'Owner expenses CRUD without authentication rejected with HTTP 401',
-      ownerExpensesNoAuth.status === 401
-    );
-
-    const ownerSettlementsNoAuth = await apiRequest('/api/owner/settlements');
-    recordResult(
-      'Owner settlements ledger without authentication rejected with HTTP 401',
-      ownerSettlementsNoAuth.status === 401
-    );
-
-    const ownerCsvNoAuth = await apiRequest('/api/owner/export-csv');
-    recordResult(
-      'Owner CSV ledger export without authentication rejected with HTTP 401',
-      ownerCsvNoAuth.status === 401
-    );
-
-    // --------------------------------------------------------------------------
-    // TEST GROUP 3: SERVER-AUTHORITATIVE FINANCIAL & ORDER PRICING
-    // --------------------------------------------------------------------------
-    console.log('\n>>> TEST GROUP 3: Financial Calculations & Anti-Tampering');
-
-    // Test business settings rules directly:
-    // Approved Thali Prices: Mini=₹49, Regular=₹69, Full=₹79
-    const miniPrice = 49;
-    const regPrice = 69;
-    const fullPrice = 79;
-    const standardDeliveryFee = 25;
-    const freeDeliveryThreshold = 250;
-    const platformFee = 5;
-    const packagingFee = 10;
-    const commissionRate = 0.15;
-
-    // Subtotal below 250 -> delivery fee applies
-    const subtotalSmall = miniPrice * 2; // ₹98
-    const deliveryFeeSmall = subtotalSmall >= freeDeliveryThreshold ? 0 : standardDeliveryFee;
-    const totalSmall = subtotalSmall + deliveryFeeSmall + platformFee + packagingFee;
-    recordResult(
-      'Order under ₹250 includes ₹25 delivery fee (₹98 items + ₹25 + ₹5 + ₹10 = ₹138)',
-      deliveryFeeSmall === 25 && totalSmall === 138
-    );
-
-    // Subtotal >= 250 -> delivery fee waived (₹0)
-    const subtotalLarge = fullPrice * 4; // ₹316
-    const deliveryFeeLarge = subtotalLarge >= freeDeliveryThreshold ? 0 : standardDeliveryFee;
-    const totalLarge = subtotalLarge + deliveryFeeLarge + platformFee + packagingFee;
-    recordResult(
-      'Order at/above ₹250 waives delivery fee to ₹0 (₹316 items + ₹0 + ₹5 + ₹10 = ₹331)',
-      deliveryFeeLarge === 0 && totalLarge === 331
-    );
-
-    // Platform commission is strictly 15% on items subtotal
-    const commissionSmall = Math.round(subtotalSmall * commissionRate);
-    const cookEarningsSmall = subtotalSmall - commissionSmall;
-    recordResult(
-      'Platform commission is strictly 15% (₹98 * 15% = ₹15, Cook earnings = ₹83)',
-      commissionSmall === 15 && cookEarningsSmall === 83
-    );
-
-    // --------------------------------------------------------------------------
-    // TEST GROUP 4: IDEMPOTENCY & CONCURRENCY PROTECTION
-    // --------------------------------------------------------------------------
-    console.log('\n>>> TEST GROUP 4: Idempotency & Tamper-Evident Hashing');
-
-    const testUid = 'cust-test-nalapani-123';
-    const testCookId = 'cook-meenakshi';
-    const testItems = [{ id: 'meal-thali-reg', qty: 2 }];
-    const testAddress = {
-      fullName: 'Vipul Joshi',
-      phone: '9876543210',
-      addressLine: 'Room 12, Doon Scholars PG',
-      locality: 'Nalapani Chowk',
-    };
-
-    const signature1 = crypto
-      .createHash('sha256')
-      .update(JSON.stringify({ testUid, testCookId, testItems, testAddress }))
-      .digest('hex');
-
-    const signature2 = crypto
-      .createHash('sha256')
-      .update(JSON.stringify({ testUid, testCookId, testItems, testAddress }))
-      .digest('hex');
-
-    recordResult(
-      'Identical checkout payload generates matching tamper-evident SHA-256 signature',
-      signature1 === signature2
-    );
-
-    const tamperedAddress = { ...testAddress, addressLine: 'Tampered Address Line' };
-    const signatureTampered = crypto
-      .createHash('sha256')
-      .update(JSON.stringify({ testUid, testCookId, testItems, testAddress: tamperedAddress }))
-      .digest('hex');
-
-    recordResult(
-      'Tampered payload generates divergent signature for immediate rejection',
-      signature1 !== signatureTampered
-    );
-
-    // 64-bit Advisory lock key generation
-    const testKey = `${testUid}_ORD-20261107-TEST`;
-    const lockKey1 = crypto.createHash('md5').update('cooknow:order:lock:k1:' + testKey).digest().readInt32BE(0);
-    const lockKey2 = crypto.createHash('md5').update('cooknow:order:lock:k2:' + testKey).digest().readInt32BE(0);
-    recordResult(
-      '64-bit composite advisory lock keys generate valid non-zero signed integers',
-      typeof lockKey1 === 'number' && typeof lockKey2 === 'number' && lockKey1 !== lockKey2
-    );
-
-    // --------------------------------------------------------------------------
-    // TEST GROUP 5: PROMOTIONS & COUPON BUDGET ENFORCEMENT
-    // --------------------------------------------------------------------------
-    console.log('\n>>> TEST GROUP 5: Coupon Limits & Budget Integrity');
-
-    const promoWelcome = {
-      code: 'WELCOME50',
-      discountType: 'fixed',
-      discountValue: 50,
-      minOrderValue: 150,
-      maxDiscountCap: 50,
-      usageLimit: 500,
-      currentUsageCount: 42,
-      budgetLimit: 25000,
-      spentBudget: 2100,
-    };
-
-    // Subtotal 120 < minOrderValue 150 -> rejected
-    const isEligibleBelowMin = 120 >= promoWelcome.minOrderValue;
-    recordResult(
-      'Coupon rejected when subtotal is below minimum order value (₹120 < ₹150)',
-      isEligibleBelowMin === false
-    );
-
-    // Subtotal 180 >= 150 -> eligible
-    const isEligibleAboveMin = 180 >= promoWelcome.minOrderValue;
-    const discountWelcome = Math.min(promoWelcome.discountValue, 180, promoWelcome.maxDiscountCap);
-    recordResult(
-      'Coupon WELCOME50 applied correctly (₹50 discount on ₹180 subtotal)',
-      isEligibleAboveMin === true && discountWelcome === 50
-    );
-
-    // Exhausted usage limit test
-    const promoExhausted = { ...promoWelcome, currentUsageCount: 500, usageLimit: 500 };
-    const canRedeemExhausted = promoExhausted.currentUsageCount < promoExhausted.usageLimit;
-    recordResult(
-      'Exhausted coupon globally blocked when usage limit reached (500/500)',
-      canRedeemExhausted === false
-    );
-
-    // Exhausted budget test
-    const promoExhaustedBudget = { ...promoWelcome, spentBudget: 24980, budgetLimit: 25000 };
-    const canRedeemBudget = promoExhaustedBudget.spentBudget + 50 <= promoExhaustedBudget.budgetLimit;
-    recordResult(
-      'Coupon blocked when redemption exceeds total promotional budget (₹24,980 + ₹50 > ₹25,000)',
-      canRedeemBudget === false
-    );
-
-    // --------------------------------------------------------------------------
-    // TEST GROUP 6: ROLE AUTHORIZATION & OWNER ACCESS BOUNDARIES
-    // --------------------------------------------------------------------------
-    console.log('\n>>> TEST GROUP 6: Role Authorization & Boundary Checks');
-
-    const OWNER_EMAIL = 'vivekn528@gmail.com';
-    const attackerEmail = 'attacker@malicious.com';
-
-    recordResult(
-      `Owner authorization strictly validates against ${OWNER_EMAIL}`,
-      OWNER_EMAIL.toLowerCase() === 'vivekn528@gmail.com'
-    );
-    recordResult(
-      'Unauthorized email is denied owner administrative privileges',
-      attackerEmail.toLowerCase() !== OWNER_EMAIL
-    );
-
-    // --------------------------------------------------------------------------
-    // TEST GROUP 7: DATABASE SCHEMA & MIGRATION COMPATIBILITY AUDIT
-    // --------------------------------------------------------------------------
-    console.log('\n>>> TEST GROUP 7: Database Schema Compatibility Verification');
-
-    const migration001Path = 'supabase/migrations/001_initial_schema.sql';
-    const migration002Path = 'supabase/migrations/002_extended_features.sql';
-    const migration003Path = 'supabase/migrations/003_transactional_order_backend.sql';
-    const rollbackPath = 'supabase/migrations/003_rollback.sql';
-
-    const fs = await import('fs');
-    const m1Exists = fs.existsSync(migration001Path);
-    const m2Exists = fs.existsSync(migration002Path);
-    const m3Exists = fs.existsSync(migration003Path);
-    const rbExists = fs.existsSync(rollbackPath);
-
-    recordResult('Migration 001 exists and verified', m1Exists);
-    recordResult('Migration 002 exists and verified', m2Exists);
-    recordResult('Migration 003 exists and verified', m3Exists);
-    recordResult('Migration 003 Rollback script exists and verified', rbExists);
-
-    const m3Content = fs.readFileSync(migration003Path, 'utf8');
-    recordResult(
-      'Migration 003 contains 64-bit advisory locking with hashtext',
-      m3Content.includes('pg_advisory_xact_lock') && m3Content.includes('hashtext')
-    );
-    recordResult(
-      'Migration 003 contains deadlock-free menu item ordering (ORDER BY menu_item_id ASC)',
-      m3Content.includes('ORDER BY (x->>\'menuItemId\')::uuid ASC')
-    );
-    recordResult(
-      'Migration 003 drops insecure client insert policy on public.orders',
-      m3Content.includes('DROP POLICY IF EXISTS "Customer create orders" ON public.orders')
-    );
-    recordResult(
-      'Migration 003 enforces SECURITY DEFINER with hardened search_path = pg_catalog, public',
-      m3Content.includes('SET search_path = pg_catalog, public')
-    );
-
-    // --------------------------------------------------------------------------
-    // TEST GROUP 8: FIREBASE-FIRST PERSISTENCE & FINANCIAL AUDIT VERIFICATION
-    // --------------------------------------------------------------------------
-    console.log('\n>>> TEST GROUP 8: Firebase-First Persistence & Financial Audit Verification');
+    console.log('>>> TEST GROUP 1: Vercel Rewrite Routing & Client Config');
 
     const rootApiRes = await apiRequest('/api');
     recordResult(
-      'GET /api confirms Firebase-First Single Source of Truth (Cloud Firestore)',
+      'GET /api returns Firebase-First Single Source of Truth',
       rootApiRes.status === 200 &&
         rootApiRes.data?.architecture === 'Firebase-First Single Source of Truth' &&
         rootApiRes.data?.primaryDatabase === 'Cloud Firestore (cooknow-9444c)'
     );
 
-    const apiCode = fs.readFileSync('api/index.ts', 'utf8');
+    const rewriteConfigRes = await apiRequest('/api?__pathname=/api/config/public-client');
     recordResult(
-      'Backend uses server-only Firebase Admin credential resolution (no VITE_ leakage)',
-      apiCode.includes('FIREBASE_SERVICE_ACCOUNT_JSON') &&
-        apiCode.includes('resolveFirebaseServiceAccount') &&
-        !apiCode.includes('VITE_FIREBASE_PRIVATE_KEY')
+      'Vercel rewrite query recovery (/api?__pathname=/api/config/public-client) resolves cleanly',
+      rewriteConfigRes.status === 200 &&
+        rewriteConfigRes.data?.firebase?.projectId === 'cooknow-9444c' &&
+        rewriteConfigRes.data?.supabase?.optionalStandby === true
+    );
+
+    const rewriteOrderPostRes = await apiRequest('/api?__pathname=/api/orders/place', {
+      method: 'POST',
+      body: { cookId: 'cook-1', items: [] },
+    });
+    recordResult(
+      'Vercel POST rewrite (/api?__pathname=/api/orders/place) reaches orders/place & returns JSON 401',
+      rewriteOrderPostRes.status === 401 && rewriteOrderPostRes.contentType.includes('application/json')
+    );
+
+    const unknownApiRes = await apiRequest('/api/does-not-exist-route');
+    recordResult(
+      'Unknown /api route returns structured JSON 404 (never raw HTML)',
+      unknownApiRes.status === 404 &&
+        unknownApiRes.contentType.includes('application/json') &&
+        unknownApiRes.data?.success === false
     );
 
     recordResult(
-      'Public client config endpoint does not expose Firebase Admin credentials',
-      !JSON.stringify(configRes.data).includes('private_key') &&
-        !JSON.stringify(configRes.data).includes('client_email')
+      'Public client config does not expose any private keys or service_role secrets',
+      !JSON.stringify(rewriteConfigRes.data).includes('private_key') &&
+        !JSON.stringify(rewriteConfigRes.data).includes('client_email') &&
+        !JSON.stringify(rewriteConfigRes.data).includes('service_role')
+    );
+
+    // --------------------------------------------------------------------------
+    // TEST GROUP 2: AUTHENTICATION & JWKS CRYPTOGRAPHIC GATES
+    // --------------------------------------------------------------------------
+    console.log('\n>>> TEST GROUP 2: Authentication & Role Verification');
+
+    const ownerValidRes = await apiRequest('/api/auth/verify-owner', {
+      method: 'POST',
+      token: ownerToken,
+    });
+    recordResult(
+      'POST /api/auth/verify-owner verifies owner JWT cryptographically',
+      ownerValidRes.status === 200 && ownerValidRes.data?.verified === true
+    );
+
+    const ownerUnverifiedRes = await apiRequest('/api/auth/verify-owner', {
+      method: 'POST',
+      token: unverifiedOwnerToken,
+    });
+    recordResult(
+      'POST /api/auth/verify-owner rejects unverified email with HTTP 403',
+      ownerUnverifiedRes.status === 403 && ownerUnverifiedRes.data?.verified === false
+    );
+
+    const customerAsOwnerRes = await apiRequest('/api/orders/admin-all', {
+      token: customerToken,
+    });
+    recordResult(
+      'Customer blocked from GET /api/orders/admin-all with HTTP 403',
+      customerAsOwnerRes.status === 403
+    );
+
+    const forgedRes = await apiRequest('/api/auth/verify-owner', {
+      method: 'POST',
+      token: 'forged.invalid.jwt',
+    });
+    recordResult(
+      'Malformed JWT rejected with HTTP 401',
+      forgedRes.status === 401 && forgedRes.data?.verified === false
+    );
+
+    // --------------------------------------------------------------------------
+    // TEST GROUP 3: END-TO-END ORDER PLACEMENT, PRICING & ANTI-TAMPERING
+    // --------------------------------------------------------------------------
+    console.log('\n>>> TEST GROUP 3: Server-Authoritative Order Placement & COD Pricing');
+
+    // 3a. Serverless fail-closed guard when Vercel runs without Firebase Admin credentials
+    const prevVercel = process.env.VERCEL;
+    process.env.VERCEL = '1';
+    process.env.TEST_ENFORCE_SERVERLESS_GUARD = 'true';
+    const serverlessMissingCredsRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: customerToken,
+      body: { cookId: 'cook-1', items: [{ menuItemId: 'menu-student-full', quantity: 1 }] },
+    });
+    process.env.VERCEL = prevVercel;
+    delete process.env.TEST_ENFORCE_SERVERLESS_GUARD;
+    recordResult(
+      'Serverless Vercel rejects order placement with JSON 503 if Admin credentials are missing',
+      serverlessMissingCredsRes.status === 503 &&
+        String(serverlessMissingCredsRes.data?.error || '').includes('Firebase Admin credentials')
+    );
+
+    // 3b. Reject disabled UPI/online payment method
+    const upiRejectedRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        cookId: 'cook-1',
+        items: [{ menuItemId: 'menu-student-full', quantity: 1 }],
+        paymentMethod: 'upi_online',
+        idempotencyKey: 'idem-upi-block-1',
+        deliveryAddress: {
+          fullName: 'Aarav Rawat',
+          phone: '9876543210',
+          locality: 'Nalapani Chowk',
+          addressLine: 'Room 12, Shivalik PG',
+        },
+      },
+    });
+    recordResult(
+      'UPI/online payment method rejected with HTTP 400 (COD-only enforced)',
+      upiRejectedRes.status === 400 &&
+        String(upiRejectedRes.data?.error || '').toLowerCase().includes('cash on delivery')
+    );
+
+    // 3c. Reject unverified cook-5
+    const unverifiedCookRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        cookId: 'cook-5',
+        items: [{ menuItemId: 'menu-student-full', quantity: 1 }],
+        paymentMethod: 'cod',
+        idempotencyKey: 'idem-unverified-cook-1',
+        deliveryAddress: {
+          fullName: 'Aarav Rawat',
+          phone: '9876543210',
+          locality: 'Nalapani Chowk',
+          addressLine: 'Room 12, Shivalik PG',
+        },
+      },
+    });
+    recordResult(
+      'Unverified cook (cook-5) rejected with HTTP 400',
+      unverifiedCookRes.status === 400
+    );
+
+    // 3d. Place Student Special Full Thali (₹79 x 2 = ₹158 < ₹250 -> ₹25 delivery + ₹5 platform + ₹10 packaging = ₹198)
+    // Attempt price tampering via malicious fields in request body
+    const idemKeySmall = `idem_small_${Date.now()}`;
+    const smallOrderRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        cookId: 'cook-1',
+        items: [{ menuItemId: 'menu-student-full', quantity: 2, unitPrice: 1, price: 1 }],
+        itemsSubtotal: 2,
+        finalPayableAmount: 2,
+        role: 'admin',
+        paymentMethod: 'cod',
+        idempotencyKey: idemKeySmall,
+        deliveryAddress: {
+          fullName: 'Aarav Rawat',
+          phone: '9876543210',
+          locality: 'Nalapani Chowk',
+          addressLine: 'Room 12, Shivalik PG',
+        },
+      },
+    });
+    const placedSmallOrder = smallOrderRes.data?.order;
+    recordResult(
+      'Small order places cleanly & ignores client price tampering (₹79*2 + ₹25 + ₹5 + ₹10 = ₹198, 15% comm = ₹24)',
+      smallOrderRes.status === 200 &&
+        smallOrderRes.data?.success === true &&
+        placedSmallOrder?.itemsSubtotal === 158 &&
+        placedSmallOrder?.deliveryFee === 25 &&
+        placedSmallOrder?.platformFee === 5 &&
+        placedSmallOrder?.packagingFee === 10 &&
+        placedSmallOrder?.finalPayableAmount === 198 &&
+        placedSmallOrder?.platformCommission === 24 &&
+        placedSmallOrder?.cookEarnings === 134 &&
+        placedSmallOrder?.cookUserId === 'user-cook-1'
+    );
+
+    // 3e. Verify Student Special Thali exact canonical pricing Mini=₹49, Regular=₹69, Full=₹79 & ≥₹250 free delivery + PAHADI15 shared discount
+    const largeOrderRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        cookId: 'cook-1',
+        items: [
+          { menuItemId: 'menu-student-full', quantity: 2 }, // 158
+          { menuItemId: 'menu-pahadi-aloo', quantity: 1 }, // 120 -> subtotal 278 >= 250
+        ],
+        promoCode: 'PAHADI15', // 15% of 278 = 42 (50% shared -> partner share = 21)
+        paymentMethod: 'cod',
+        idempotencyKey: `idem_large_${Date.now()}`,
+        deliveryAddress: {
+          fullName: 'Aarav Rawat',
+          phone: '9876543210',
+          locality: 'Raipur Road',
+          addressLine: 'Flat 4B, Tapovan Enclave',
+        },
+      },
+    });
+    const placedLargeOrder = largeOrderRes.data?.order;
+    recordResult(
+      'Order >= ₹250 waives delivery fee (₹0) & computes shared promo PAHADI15 accurately (₹278 + ₹0 + ₹5 + ₹10 - ₹42 = ₹251)',
+      largeOrderRes.status === 200 &&
+        placedLargeOrder?.itemsSubtotal === 278 &&
+        placedLargeOrder?.deliveryFee === 0 &&
+        placedLargeOrder?.discount === 42 &&
+        placedLargeOrder?.discountFunding === 'shared_funded' &&
+        placedLargeOrder?.finalPayableAmount === 251 &&
+        placedLargeOrder?.platformCommission === 42 &&
+        placedLargeOrder?.cookEarnings === 215
+    );
+
+    // Mini ₹49 & Regular ₹69 orders
+    const miniOrderRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        cookId: 'cook-2',
+        items: [{ menuItemId: 'menu-student-mini', quantity: 1 }],
+        paymentMethod: 'cod',
+        idempotencyKey: `idem_mini_${Date.now()}`,
+        deliveryAddress: {
+          fullName: 'Aarav Rawat',
+          phone: '9876543210',
+          locality: 'Nalapani Chowk',
+          addressLine: 'Room 12',
+        },
+      },
+    });
+    const regularOrderRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        cookId: 'cook-4',
+        items: [{ menuItemId: 'menu-student-regular', quantity: 1 }],
+        paymentMethod: 'cod',
+        idempotencyKey: `idem_reg_${Date.now()}`,
+        deliveryAddress: {
+          fullName: 'Aarav Rawat',
+          phone: '9876543210',
+          locality: 'Nalapani Chowk',
+          addressLine: 'Room 12',
+        },
+      },
+    });
+    recordResult(
+      'Student Special Thali Mini (₹49) and Regular (₹69) prices enforced by backend',
+      miniOrderRes.status === 200 &&
+        miniOrderRes.data?.order?.itemsSubtotal === 49 &&
+        regularOrderRes.status === 200 &&
+        regularOrderRes.data?.order?.itemsSubtotal === 69
+    );
+
+    // --------------------------------------------------------------------------
+    // TEST GROUP 4: DUPLICATE ORDER IDEMPOTENCY & REPLAY PROTECTION
+    // --------------------------------------------------------------------------
+    console.log('\n>>> TEST GROUP 4: Duplicate Order Prevention (Idempotency)');
+
+    const replaySameRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        cookId: 'cook-1',
+        items: [{ menuItemId: 'menu-student-full', quantity: 2 }],
+        paymentMethod: 'cod',
+        idempotencyKey: idemKeySmall,
+        deliveryAddress: {
+          fullName: 'Aarav Rawat',
+          phone: '9876543210',
+          locality: 'Nalapani Chowk',
+          addressLine: 'Room 12, Shivalik PG',
+        },
+      },
+    });
+    recordResult(
+      'Repeated request with identical idempotencyKey returns original order ID without duplicating',
+      replaySameRes.status === 200 && replaySameRes.data?.order?.id === placedSmallOrder?.id
+    );
+
+    const replayTamperedRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        cookId: 'cook-1',
+        items: [{ menuItemId: 'menu-student-full', quantity: 3 }],
+        paymentMethod: 'cod',
+        idempotencyKey: idemKeySmall,
+        deliveryAddress: {
+          fullName: 'Aarav Rawat',
+          phone: '9876543210',
+          locality: 'Nalapani Chowk',
+          addressLine: 'Room 12, Shivalik PG',
+        },
+      },
+    });
+    recordResult(
+      'Reusing idempotencyKey with altered order items returns HTTP 409 conflict',
+      replayTamperedRes.status === 409
+    );
+
+    const replayCrossCustomerRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: secondCustomerToken,
+      body: {
+        cookId: 'cook-1',
+        items: [{ menuItemId: 'menu-student-full', quantity: 2 }],
+        paymentMethod: 'cod',
+        idempotencyKey: idemKeySmall,
+        deliveryAddress: {
+          fullName: 'Riya Bisht',
+          phone: '9876543210',
+          locality: 'Nalapani Chowk',
+          addressLine: 'Room 12, Shivalik PG',
+        },
+      },
+    });
+    recordResult(
+      'Cross-customer idempotencyKey reuse rejected with HTTP 403',
+      replayCrossCustomerRes.status === 403
+    );
+
+    // --------------------------------------------------------------------------
+    // TEST GROUP 5: END-TO-END ORDER WORKFLOW, STATUS TRANSITIONS & COD RECONCILIATION
+    // --------------------------------------------------------------------------
+    console.log('\n>>> TEST GROUP 5: Full Order Workflow, Status Validation & COD Settlement');
+
+    const myOrdersRes = await apiRequest('/api/orders/my-orders', { token: customerToken });
+    recordResult(
+      'Customer GET /api/orders/my-orders returns customer-owned order',
+      myOrdersRes.status === 200 &&
+        myOrdersRes.data?.orders?.some((o: any) => o.id === placedSmallOrder?.id)
+    );
+
+    const kitchenOrdersRes = await apiRequest('/api/orders/kitchen-orders', { token: cookToken });
+    recordResult(
+      'Cook GET /api/orders/kitchen-orders shows eligible pending order',
+      kitchenOrdersRes.status === 200 &&
+        kitchenOrdersRes.data?.orders?.some((o: any) => o.id === placedSmallOrder?.id)
+    );
+
+    const customerAcceptDenied = await apiRequest(`/api/orders/${placedSmallOrder?.id}/status`, {
+      method: 'PATCH',
+      token: customerToken,
+      body: { status: 'accepted' },
+    });
+    recordResult(
+      'Customer denied permission to accept their own order (HTTP 403)',
+      customerAcceptDenied.status === 403
+    );
+
+    const invalidSkipTransition = await apiRequest(`/api/orders/${placedSmallOrder?.id}/status`, {
+      method: 'PATCH',
+      token: cookToken,
+      body: { status: 'delivered' },
+    });
+    recordResult(
+      'Invalid state transition pending -> delivered rejected (HTTP 400)',
+      invalidSkipTransition.status === 400
+    );
+
+    const s1 = await apiRequest(`/api/orders/${placedSmallOrder?.id}/status`, {
+      method: 'PATCH',
+      token: cookToken,
+      body: { status: 'accepted' },
+    });
+    const s2 = await apiRequest(`/api/orders/${placedSmallOrder?.id}/status`, {
+      method: 'PATCH',
+      token: cookToken,
+      body: { status: 'preparing' },
+    });
+    const s3 = await apiRequest(`/api/orders/${placedSmallOrder?.id}/status`, {
+      method: 'PATCH',
+      token: cookToken,
+      body: { status: 'ready' },
+    });
+    recordResult(
+      'Cook advances order lifecycle pending -> accepted -> preparing -> ready',
+      s1.status === 200 && s2.status === 200 && s3.status === 200 && s3.data?.order?.status === 'ready'
+    );
+
+    const riderOrdersRes = await apiRequest('/api/orders/rider-orders', { token: riderToken });
+    recordResult(
+      'Delivery partner GET /api/orders/rider-orders views ready dispatch order',
+      riderOrdersRes.status === 200 &&
+        riderOrdersRes.data?.orders?.some((o: any) => o.id === placedSmallOrder?.id)
+    );
+
+    const s4 = await apiRequest(`/api/orders/${placedSmallOrder?.id}/status`, {
+      method: 'PATCH',
+      token: riderToken,
+      body: { status: 'out_for_delivery', partnerId: 'dp-1', partnerName: 'Suresh Semwal' },
+    });
+    const s5 = await apiRequest(`/api/orders/${placedSmallOrder?.id}/status`, {
+      method: 'PATCH',
+      token: riderToken,
+      body: { status: 'delivered' },
+    });
+    recordResult(
+      'Rider advances order ready -> out_for_delivery -> delivered with pending COD remittance',
+      s4.status === 200 &&
+        s5.status === 200 &&
+        s5.data?.order?.status === 'delivered' &&
+        s5.data?.order?.paymentStatus === 'pending'
+    );
+
+    const confirmCodDeniedCustomer = await apiRequest(`/api/orders/${placedSmallOrder?.id}/confirm-cod`, {
+      method: 'PATCH',
+      token: customerToken,
+    });
+    recordResult(
+      'Non-owner blocked from confirming COD remittance (HTTP 403)',
+      confirmCodDeniedCustomer.status === 403
+    );
+
+    const confirmCodOwnerRes = await apiRequest(`/api/orders/${placedSmallOrder?.id}/confirm-cod`, {
+      method: 'PATCH',
+      token: ownerToken,
+    });
+    recordResult(
+      'Owner reconciles COD cash collection cleanly (paymentStatus = paid)',
+      confirmCodOwnerRes.status === 200 && confirmCodOwnerRes.data?.order?.paymentStatus === 'paid'
+    );
+
+    // --------------------------------------------------------------------------
+    // TEST GROUP 6: OWNER ANALYTICS & EXPENSE SOFT REVERSALS
+    // --------------------------------------------------------------------------
+    console.log('\n>>> TEST GROUP 6: Financial Analytics & Soft Reversal Audit Trail');
+
+    const expCreateRes = await apiRequest('/api/owner/expenses', {
+      method: 'POST',
+      token: ownerToken,
+      body: {
+        category: 'packaging_subsidies',
+        description: 'Audit test biodegradable containers',
+        amount: 500,
+        paymentMethod: 'upi',
+      },
+    });
+    const createdExpId = expCreateRes.data?.expense?.id;
+    const expDupRes = await apiRequest('/api/owner/expenses', {
+      method: 'POST',
+      token: ownerToken,
+      body: {
+        category: 'packaging_subsidies',
+        description: 'Audit test biodegradable containers',
+        amount: 500,
+        paymentMethod: 'upi',
+      },
+    });
+    const expReverseRes = await apiRequest(`/api/owner/expenses/${createdExpId}/reverse`, {
+      method: 'POST',
+      token: ownerToken,
+      body: { reason: 'Audit test cleanup reversal' },
+    });
+    recordResult(
+      'Operating expense duplicate prevention (409) & immutable soft reversal works',
+      expCreateRes.status === 200 &&
+        expDupRes.status === 409 &&
+        expReverseRes.status === 200 &&
+        expReverseRes.data?.expense?.isReversed === true
+    );
+
+    const analyticsRes = await apiRequest('/api/owner/analytics?timeRange=30d', {
+      token: ownerToken,
+    });
+    const metrics = analyticsRes.data?.metrics;
+    recordResult(
+      'Owner analytics separates GMV, commission, cook payouts, COD collected & excludes reversed expenses',
+      analyticsRes.status === 200 &&
+        metrics &&
+        metrics.grossMerchandiseValue > metrics.totalCookNowPlatformRevenue &&
+        metrics.cashCollected >= 198 &&
+        metrics.reversedExpensesCount >= 1
+    );
+
+    // --------------------------------------------------------------------------
+    // TEST GROUP 7: SUPABASE ARCHIVE & FIRESTORE RULES INTEGRITY
+    // --------------------------------------------------------------------------
+    console.log('\n>>> TEST GROUP 7: Firestore Rules, Supabase Standby & Secret Safety');
+
+    const apiCode = fs.readFileSync('api/index.ts', 'utf8');
+    recordResult(
+      'Backend resolves server-only Admin credentials without VITE_ private key leakage or Supabase in /orders/place',
+      apiCode.includes('FIREBASE_SERVICE_ACCOUNT_JSON') &&
+        apiCode.includes('resolveFirebaseServiceAccount') &&
+        !apiCode.includes('VITE_FIREBASE_PRIVATE_KEY') &&
+        !apiCode.includes('@supabase/supabase-js')
+    );
+
+    const m1Exists = fs.existsSync('supabase/migrations/001_initial_schema.sql');
+    const m2Exists = fs.existsSync('supabase/migrations/002_extended_features.sql');
+    const m3Exists = fs.existsSync('supabase/migrations/003_transactional_order_backend.sql');
+    recordResult(
+      'Archived Supabase SQL migration files remain intact (non-destructive)',
+      m1Exists && m2Exists && m3Exists
     );
 
     const rulesCode = fs.readFileSync('firestore.rules', 'utf8');
     recordResult(
-      'firestore.rules enforces strict RBAC on orders, settlements, expenses, and audit_logs',
+      'firestore.rules protects orders, settlements, operating_expenses & audit_logs',
       rulesCode.includes('match /orders/{orderId}') &&
         rulesCode.includes('match /settlements/{settlementId}') &&
         rulesCode.includes('match /operating_expenses/{expenseId}') &&
         rulesCode.includes('match /audit_logs/{logId}')
     );
 
-    const confirmCodNoAuth = await apiRequest('/api/orders/ORD-9821/confirm-cod', { method: 'PATCH' });
-    recordResult(
-      'Unauthenticated COD remittance confirmation rejected with HTTP 401',
-      confirmCodNoAuth.status === 401
-    );
-
-    const reverseExpenseNoAuth = await apiRequest('/api/owner/expenses/exp-1/reverse', {
-      method: 'POST',
-      body: { reason: 'Duplicate test' },
-    });
-    recordResult(
-      'Unauthenticated expense reversal rejected with HTTP 401',
-      reverseExpenseNoAuth.status === 401
-    );
-
     console.log('\n================================================================');
-    console.log(`   TEST EXECUTION SUMMARY: ${passedTests} / ${totalTests} TESTS PASSED (100%)`);
+    console.log(
+      `   TEST EXECUTION SUMMARY: ${passedTests} / ${totalTests} TESTS PASSED (${Math.round(
+        (passedTests / totalTests) * 100
+      )}%)`
+    );
     console.log('================================================================\n');
 
+    if (failures.length > 0) {
+      console.error('Failed tests:', failures);
+      process.exit(1);
+    }
   } catch (err: any) {
     console.error('Test suite failed with unexpected error:', err);
     process.exit(1);
   } finally {
+    delete process.env.COOKNOW_TEST_PUBLIC_JWK;
     if (server) {
       server.close();
     }
@@ -405,3 +675,4 @@ runTestSuite().catch((e) => {
   console.error(e);
   process.exit(1);
 });
+
