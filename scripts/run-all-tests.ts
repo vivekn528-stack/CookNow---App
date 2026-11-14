@@ -641,11 +641,264 @@ async function runTestSuite() {
 
     const rulesCode = fs.readFileSync('firestore.rules', 'utf8');
     recordResult(
-      'firestore.rules protects orders, settlements, operating_expenses & audit_logs',
+      'firestore.rules protects orders, settlements, operating_expenses, audit_logs & support_tickets',
       rulesCode.includes('match /orders/{orderId}') &&
         rulesCode.includes('match /settlements/{settlementId}') &&
         rulesCode.includes('match /operating_expenses/{expenseId}') &&
-        rulesCode.includes('match /audit_logs/{logId}')
+        rulesCode.includes('match /audit_logs/{logId}') &&
+        rulesCode.includes('match /support_tickets/{ticketId}') &&
+        rulesCode.includes('match /internal_notes/{noteId}')
+    );
+
+    // --------------------------------------------------------------------------
+    // TEST GROUP 8: CUSTOMER CARE & SUPPORT CENTRE (OWNER + CUSTOMER)
+    // --------------------------------------------------------------------------
+    console.log('\n>>> TEST GROUP 8: Customer Care & Support Centre (RBAC, Order-Link, Notes, Refunds, CSAT)');
+
+    const unauthSupportRes = await apiRequest('/api/support/tickets');
+    recordResult(
+      'Unauthenticated GET /api/support/tickets rejected with HTTP 401',
+      unauthSupportRes.status === 401
+    );
+
+    const customerOwnerListDenied = await apiRequest('/api/support/tickets', {
+      token: customerToken,
+    });
+    recordResult(
+      'Non-owner customer blocked from Owner support dashboard GET /api/support/tickets (HTTP 403)',
+      customerOwnerListDenied.status === 403
+    );
+
+    const crossOrderTicketDenied = await apiRequest('/api/support/tickets', {
+      method: 'POST',
+      token: secondCustomerToken,
+      body: {
+        category: 'Missing Item',
+        priority: 'High',
+        subject: 'Attempt attaching another customer order',
+        description: 'Testing cross-customer order linkage authorization check.',
+        orderId: placedSmallOrder?.id,
+      },
+    });
+    recordResult(
+      'Cross-customer order linkage blocked with HTTP 403',
+      crossOrderTicketDenied.status === 403
+    );
+
+    const createOrderTicketRes = await apiRequest('/api/support/tickets', {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        category: 'Missing Item',
+        priority: 'Urgent',
+        subject: 'Sweet kheer missing in delivered dinner order',
+        description: 'Received main thali items, but one side item was missing from thermal bag.',
+        orderId: placedSmallOrder?.id,
+        customerPhone: '9876543210',
+        requestRefund: true,
+      },
+    });
+    const orderTicket = createOrderTicketRes.data?.ticket;
+    recordResult(
+      'Customer creates order-linked Urgent ticket with real orderSnapshot & Requested refund',
+      createOrderTicketRes.status === 201 &&
+        Boolean(orderTicket?.id) &&
+        orderTicket?.orderId === placedSmallOrder?.id &&
+        orderTicket?.orderSnapshot?.kitchenName === "Sunita's Pahadi Rasoi" &&
+        orderTicket?.refund?.status === 'Requested'
+    );
+
+    const createGeneralTicketRes = await apiRequest('/api/support/tickets', {
+      method: 'POST',
+      token: secondCustomerToken,
+      body: {
+        category: 'Account / Login Issue',
+        priority: 'Low',
+        subject: 'Hostel address update clarification',
+        description: 'Unable to edit saved hostel room number on profile page.',
+        customerPhone: '9811122233',
+      },
+    });
+    const generalTicket = createGeneralTicketRes.data?.ticket;
+    recordResult(
+      'Second customer creates general Low-priority ticket cleanly',
+      createGeneralTicketRes.status === 201 && Boolean(generalTicket?.id)
+    );
+
+    const customer1MyTicketsRes = await apiRequest('/api/support/my-tickets', {
+      token: customerToken,
+    });
+    recordResult(
+      'GET /api/support/my-tickets enforces strict UID isolation (customer 1 only sees own ticket)',
+      customer1MyTicketsRes.status === 200 &&
+        customer1MyTicketsRes.data?.tickets?.some((t: any) => t.id === orderTicket?.id) &&
+        !customer1MyTicketsRes.data?.tickets?.some((t: any) => t.id === generalTicket?.id)
+    );
+
+    const crossCustomerTicketReadDenied = await apiRequest(`/api/support/tickets/${orderTicket?.id}`, {
+      token: secondCustomerToken,
+    });
+    recordResult(
+      'Cross-customer GET /api/support/tickets/:id rejected with HTTP 403',
+      crossCustomerTicketReadDenied.status === 403
+    );
+
+    const ownerFilterSearchRes = await apiRequest(
+      `/api/support/tickets?search=${encodeURIComponent(orderTicket?.id || '')}&priority=Urgent&status=Open`,
+      { token: ownerToken }
+    );
+    const initialStats = ownerFilterSearchRes.data?.stats;
+    recordResult(
+      'Owner GET /api/support/tickets filters by search/priority/status & computes real Firestore KPI stats',
+      ownerFilterSearchRes.status === 200 &&
+        ownerFilterSearchRes.data?.tickets?.length === 1 &&
+        initialStats?.totalTickets === 2 &&
+        initialStats?.openTickets === 2 &&
+        initialStats?.urgentActiveTickets === 1
+    );
+
+    const customerInternalNoteDenied = await apiRequest(
+      `/api/support/tickets/${orderTicket?.id}/internal-notes`,
+      {
+        method: 'POST',
+        token: customerToken,
+        body: { body: 'Trying to inject staff internal note' },
+      }
+    );
+    recordResult(
+      'Customer blocked from adding internal staff notes (HTTP 403)',
+      customerInternalNoteDenied.status === 403
+    );
+
+    const ownerInternalNoteRes = await apiRequest(
+      `/api/support/tickets/${orderTicket?.id}/internal-notes`,
+      {
+        method: 'POST',
+        token: ownerToken,
+        body: { body: 'Verified with Sunita Rasoi kitchen CCTV — kheer cup left on counter.' },
+      }
+    );
+    const ownerReplyRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}/reply`, {
+      method: 'POST',
+      token: ownerToken,
+      body: {
+        body: 'Apologies Aarav! We verified this with the kitchen and approved your ₹49 partial refund.',
+        nextStatus: 'Waiting for Customer',
+      },
+    });
+    const customerReadDetailRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}?markRead=true`, {
+      token: customerToken,
+    });
+    recordResult(
+      'Owner internal note is strictly isolated from Customer GET detail while public reply is visible',
+      ownerInternalNoteRes.status === 201 &&
+        ownerReplyRes.status === 200 &&
+        customerReadDetailRes.status === 200 &&
+        customerReadDetailRes.data?.messages?.length === 2 &&
+        customerReadDetailRes.data?.internalNotes === undefined &&
+        !JSON.stringify(customerReadDetailRes.data).includes('CCTV')
+    );
+
+    const ownerReadDetailRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}`, {
+      token: ownerToken,
+    });
+    recordResult(
+      'Owner GET ticket detail receives internalNotes, messages, linkedOrder & auditLogs',
+      ownerReadDetailRes.status === 200 &&
+        ownerReadDetailRes.data?.internalNotes?.length === 1 &&
+        ownerReadDetailRes.data?.linkedOrder?.id === placedSmallOrder?.id &&
+        Array.isArray(ownerReadDetailRes.data?.auditLogs)
+    );
+
+    // Refund Validation & Audit Guards
+    const overOrderRefundRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}/refund`, {
+      method: 'POST',
+      token: ownerToken,
+      body: {
+        status: 'Approved',
+        amount: 9999,
+        reason: 'Testing order total cap enforcement',
+      },
+    });
+    const unconfirmedProcessedRefundRes = await apiRequest(
+      `/api/support/tickets/${orderTicket?.id}/refund`,
+      {
+        method: 'POST',
+        token: ownerToken,
+        body: {
+          status: 'Processed',
+          amount: 49,
+          reason: 'Partial refund for missing item',
+          manualConfirmationChecked: false,
+          settlementReference: '',
+        },
+      }
+    );
+    const approvedRefundRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}/refund`, {
+      method: 'POST',
+      token: ownerToken,
+      body: {
+        status: 'Approved',
+        amount: 49,
+        reason: 'Verified missing dessert cup',
+      },
+    });
+    const processedRefundRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}/refund`, {
+      method: 'POST',
+      token: ownerToken,
+      body: {
+        status: 'Processed',
+        amount: 49,
+        reason: 'Manually settled via UPI to customer mobile',
+        settlementReference: 'UPI-MAN-884201',
+        manualConfirmationChecked: true,
+      },
+    });
+    recordResult(
+      'Refund engine blocks over-amount & unconfirmed Processed, and audits Approved -> Processed settlement',
+      overOrderRefundRes.status === 400 &&
+        unconfirmedProcessedRefundRes.status === 400 &&
+        approvedRefundRes.status === 200 &&
+        processedRefundRes.status === 200 &&
+        processedRefundRes.data?.refund?.status === 'Processed' &&
+        processedRefundRes.data?.refund?.settlementReference === 'UPI-MAN-884201'
+    );
+
+    // CSAT blocked before Resolved
+    const earlyCsatRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}/csat`, {
+      method: 'POST',
+      token: customerToken,
+      body: { rating: 5, feedback: 'Too early' },
+    });
+    const resolveTicketRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}`, {
+      method: 'PATCH',
+      token: ownerToken,
+      body: {
+        status: 'Resolved',
+        assignedAgentId: 'owner-vivek',
+        assignedAgentName: 'Vivek Singh Negi (Owner · Super Admin)',
+      },
+    });
+    const validCsatRes = await apiRequest(`/api/support/tickets/${orderTicket?.id}/csat`, {
+      method: 'POST',
+      token: customerToken,
+      body: { rating: 5, feedback: 'Fast response and fair settlement.' },
+    });
+    const finalOwnerListRes = await apiRequest('/api/support/tickets', {
+      token: ownerToken,
+    });
+    const finalStats = finalOwnerListRes.data?.stats;
+    recordResult(
+      'Status transition to Resolved sets resolvedAt, enables 1-5 CSAT rating & updates live CSAT/Resolution KPIs',
+      earlyCsatRes.status === 400 &&
+        resolveTicketRes.status === 200 &&
+        Boolean(resolveTicketRes.data?.ticket?.resolvedAt) &&
+        validCsatRes.status === 200 &&
+        validCsatRes.data?.ticket?.satisfactionRating === 5 &&
+        finalStats?.resolvedTickets === 1 &&
+        finalStats?.avgSatisfactionRating === 5 &&
+        finalStats?.satisfactionResponseCount === 1 &&
+        typeof finalStats?.avgResolutionMinutes === 'number'
     );
 
     console.log('\n================================================================');

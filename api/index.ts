@@ -2477,6 +2477,1148 @@ router.post('/config/supabase', asyncHandler(async (_req: Request, res: Response
 }));
 
 // ------------------------------------------------------------------------------
+// CUSTOMER CARE & SUPPORT CENTRE (Owner Command Centre + Customer Portal)
+// Strictly backed by Cloud Firestore (no fake data, isolated staff internal notes)
+// ------------------------------------------------------------------------------
+const SUPPORT_CATEGORIES = [
+  'Order Not Delivered',
+  'Late Delivery',
+  'Wrong Food Item',
+  'Missing Item',
+  'Food Quality Complaint',
+  'Refund Request',
+  'Payment / COD Issue',
+  'Coupon / Discount Issue',
+  'Kitchen / Cook Complaint',
+  'Rider Behaviour',
+  'Account / Login Issue',
+  'Other',
+] as const;
+
+const SUPPORT_STATUSES = [
+  'Open',
+  'In Progress',
+  'Waiting for Customer',
+  'Resolved',
+  'Closed',
+] as const;
+
+const SUPPORT_PRIORITIES = ['Low', 'Medium', 'High', 'Urgent'] as const;
+
+const SUPPORT_REFUND_STATUSES = ['None', 'Requested', 'Approved', 'Rejected', 'Processed'] as const;
+
+// Transient per-process caches (always start empty; never seeded with fake tickets)
+const LIVE_SUPPORT_TICKETS_CACHE = new Map<string, any>();
+const LIVE_SUPPORT_MESSAGES_CACHE = new Map<string, any[]>();
+const LIVE_SUPPORT_INTERNAL_NOTES_CACHE = new Map<string, any[]>();
+const LIVE_SUPPORT_AUDIT_LOGS_CACHE = new Map<string, any[]>();
+
+function isVerifiedOwnerUser(user: VerifiedFirebaseUser | null): boolean {
+  return Boolean(
+    user &&
+      user.emailVerified &&
+      user.email.toLowerCase().trim() === OWNER_EMAIL.toLowerCase()
+  );
+}
+
+async function persistSupportAuditLog(entry: {
+  id: string;
+  action: string;
+  targetType: string;
+  targetId: string;
+  actorUid: string;
+  actorEmail: string;
+  actorName: string;
+  details: string;
+  metadata?: Record<string, any>;
+  createdAt: string;
+}) {
+  const existing = LIVE_SUPPORT_AUDIT_LOGS_CACHE.get(entry.targetId) || [];
+  LIVE_SUPPORT_AUDIT_LOGS_CACHE.set(entry.targetId, [...existing, entry]);
+
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      await firestoreDb.collection('audit_logs').doc(entry.id).set(entry);
+    } catch (err: any) {
+      console.error('[Support Audit] Failed writing audit log to Firestore:', {
+        id: entry.id,
+        code: err?.code,
+        message: err?.message,
+      });
+    }
+  }
+}
+
+async function fetchAllSupportTickets(): Promise<any[]> {
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      const snap = await firestoreDb.collection('support_tickets').get();
+      const fromFs = snap.docs.map((d: any) => ({ id: d.id, ...d.data() }));
+      for (const t of fromFs) {
+        LIVE_SUPPORT_TICKETS_CACHE.set(t.id, t);
+      }
+      fromFs.sort(
+        (a: any, b: any) =>
+          new Date(b.updatedAt || b.createdAt || 0).getTime() -
+          new Date(a.updatedAt || a.createdAt || 0).getTime()
+      );
+      return fromFs;
+    } catch (err: any) {
+      console.error('[Support] Failed querying support_tickets in Firestore:', {
+        code: err?.code,
+        message: err?.message,
+      });
+    }
+  }
+  const list = Array.from(LIVE_SUPPORT_TICKETS_CACHE.values());
+  list.sort(
+    (a: any, b: any) =>
+      new Date(b.updatedAt || b.createdAt || 0).getTime() -
+      new Date(a.updatedAt || a.createdAt || 0).getTime()
+  );
+  return list;
+}
+
+async function fetchSingleSupportTicket(ticketId: string): Promise<any | null> {
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      const snap = await firestoreDb.collection('support_tickets').doc(ticketId).get();
+      if (snap.exists) {
+        const ticket = { id: snap.id, ...snap.data() };
+        LIVE_SUPPORT_TICKETS_CACHE.set(ticket.id, ticket);
+        return ticket;
+      }
+    } catch (err: any) {
+      console.error('[Support] Failed fetching single ticket from Firestore:', {
+        ticketId,
+        code: err?.code,
+        message: err?.message,
+      });
+    }
+  }
+  return LIVE_SUPPORT_TICKETS_CACHE.get(ticketId) || null;
+}
+
+async function saveSupportTicketRecord(ticket: any): Promise<void> {
+  if (hasAdminCredentials && firestoreDb) {
+    await firestoreDb.collection('support_tickets').doc(ticket.id).set(ticket, { merge: true });
+  }
+  LIVE_SUPPORT_TICKETS_CACHE.set(ticket.id, ticket);
+}
+
+async function fetchSupportTicketMessages(ticketId: string): Promise<any[]> {
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      const snap = await firestoreDb
+        .collection('support_tickets')
+        .doc(ticketId)
+        .collection('messages')
+        .get();
+      const list = snap.docs.map((d: any) => ({ id: d.id, ...d.data() }));
+      list.sort(
+        (a: any, b: any) =>
+          new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
+      );
+      LIVE_SUPPORT_MESSAGES_CACHE.set(ticketId, list);
+      return list;
+    } catch (err: any) {
+      console.error('[Support] Failed reading ticket messages:', {
+        ticketId,
+        code: err?.code,
+        message: err?.message,
+      });
+    }
+  }
+  const cached = LIVE_SUPPORT_MESSAGES_CACHE.get(ticketId) || [];
+  return [...cached].sort(
+    (a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
+  );
+}
+
+async function fetchSupportTicketInternalNotes(ticketId: string): Promise<any[]> {
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      const snap = await firestoreDb
+        .collection('support_tickets')
+        .doc(ticketId)
+        .collection('internal_notes')
+        .get();
+      const list = snap.docs.map((d: any) => ({ id: d.id, ...d.data() }));
+      list.sort(
+        (a: any, b: any) =>
+          new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
+      );
+      LIVE_SUPPORT_INTERNAL_NOTES_CACHE.set(ticketId, list);
+      return list;
+    } catch (err: any) {
+      console.error('[Support] Failed reading ticket internal_notes:', {
+        ticketId,
+        code: err?.code,
+        message: err?.message,
+      });
+    }
+  }
+  const cached = LIVE_SUPPORT_INTERNAL_NOTES_CACHE.get(ticketId) || [];
+  return [...cached].sort(
+    (a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
+  );
+}
+
+function computeSupportStats(tickets: any[]) {
+  const totalTickets = tickets.length;
+  const openTickets = tickets.filter((t) => t.status === 'Open').length;
+  const inProgressTickets = tickets.filter((t) => t.status === 'In Progress').length;
+  const waitingForCustomerTickets = tickets.filter((t) => t.status === 'Waiting for Customer').length;
+  const resolvedOnlyTickets = tickets.filter((t) => t.status === 'Resolved').length;
+  const closedTickets = tickets.filter((t) => t.status === 'Closed').length;
+  const resolvedTickets = resolvedOnlyTickets + closedTickets;
+  const urgentActiveTickets = tickets.filter(
+    (t) => t.priority === 'Urgent' && t.status !== 'Resolved' && t.status !== 'Closed'
+  ).length;
+  const unreadForOwnerCount = tickets.filter((t) => Boolean(t.unreadForOwner)).length;
+
+  const resolutionDurationsMin: number[] = [];
+  for (const t of tickets) {
+    if ((t.status === 'Resolved' || t.status === 'Closed') && t.resolvedAt && t.createdAt) {
+      const startMs = new Date(t.createdAt).getTime();
+      const endMs = new Date(t.resolvedAt).getTime();
+      if (!Number.isNaN(startMs) && !Number.isNaN(endMs) && endMs >= startMs) {
+        resolutionDurationsMin.push((endMs - startMs) / 60000);
+      }
+    }
+  }
+  const avgResolutionMinutes =
+    resolutionDurationsMin.length > 0
+      ? Math.round(
+          resolutionDurationsMin.reduce((sum, mins) => sum + mins, 0) /
+            resolutionDurationsMin.length
+        )
+      : null;
+
+  const ratings: number[] = [];
+  for (const t of tickets) {
+    if (
+      typeof t.satisfactionRating === 'number' &&
+      t.satisfactionRating >= 1 &&
+      t.satisfactionRating <= 5
+    ) {
+      ratings.push(t.satisfactionRating);
+    }
+  }
+  const avgSatisfactionRating =
+    ratings.length > 0
+      ? Number((ratings.reduce((sum, r) => sum + r, 0) / ratings.length).toFixed(2))
+      : null;
+
+  return {
+    totalTickets,
+    openTickets,
+    inProgressTickets,
+    waitingForCustomerTickets,
+    resolvedTickets,
+    closedTickets,
+    urgentActiveTickets,
+    unreadForOwnerCount,
+    avgResolutionMinutes,
+    avgSatisfactionRating,
+    satisfactionResponseCount: ratings.length,
+  };
+}
+
+// 13A. Customer Create Support Ticket (Authenticated Customer or Owner)
+router.post('/support/tickets', asyncHandler(async (req: Request, res: Response) => {
+  const verifiedUser = await extractVerifiedUser(req);
+  if (!verifiedUser) {
+    return res.status(401).json({
+      success: false,
+      error: 'Authentication required to submit a support ticket.',
+    });
+  }
+
+  const {
+    category,
+    priority,
+    subject,
+    description,
+    orderId,
+    customerPhone,
+    customerName,
+    requestRefund,
+    refundReason,
+    orderSnapshot: clientOrderSnapshot,
+  } = req.body || {};
+
+  if (!SUPPORT_CATEGORIES.includes(category)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Please select a valid complaint category.',
+    });
+  }
+
+  const safePriority = SUPPORT_PRIORITIES.includes(priority) ? priority : 'Medium';
+  const cleanSubject = typeof subject === 'string' ? subject.trim() : '';
+  const cleanDescription = typeof description === 'string' ? description.trim() : '';
+
+  if (cleanSubject.length < 3 || cleanSubject.length > 200) {
+    return res.status(400).json({
+      success: false,
+      error: 'Subject must be between 3 and 200 characters.',
+    });
+  }
+  if (cleanDescription.length < 5 || cleanDescription.length > 4000) {
+    return res.status(400).json({
+      success: false,
+      error: 'Complaint description must be between 5 and 4000 characters.',
+    });
+  }
+
+  let linkedOrderSnapshot: any = null;
+  const cleanOrderId = typeof orderId === 'string' && orderId.trim() ? orderId.trim() : null;
+
+  if (cleanOrderId) {
+    const orderRecord = await fetchSingleOrder(cleanOrderId);
+    if (orderRecord) {
+      if (!isVerifiedOwnerUser(verifiedUser) && orderRecord.customerId !== verifiedUser.uid) {
+        return res.status(403).json({
+          success: false,
+          error: 'You can only attach your own orders to a support ticket.',
+        });
+      }
+      linkedOrderSnapshot = {
+        orderId: orderRecord.id,
+        kitchenId: orderRecord.cookId || undefined,
+        kitchenName: orderRecord.kitchenName || undefined,
+        riderId: orderRecord.deliveryPartnerId || undefined,
+        riderName: orderRecord.deliveryPartnerName || undefined,
+        orderAmount: Number(orderRecord.finalPayableAmount) || 0,
+        paymentMethod: orderRecord.paymentMethod || 'cod',
+        paymentStatus: orderRecord.paymentStatus || 'pending',
+        orderStatus: orderRecord.status || 'pending',
+        itemsSummary: Array.isArray(orderRecord.items)
+          ? orderRecord.items.map((it: any) => ({
+              itemName: it.itemName,
+              quantity: Number(it.quantity) || 1,
+              unitPrice: Number(it.unitPrice) || 0,
+              subtotal: Number(it.subtotal) || 0,
+            }))
+          : [],
+      };
+    } else if (hasAdminCredentials || process.env.IS_TEST === 'true') {
+      return res.status(404).json({
+        success: false,
+        error: `Referenced order "${cleanOrderId}" could not be found.`,
+      });
+    } else if (clientOrderSnapshot && typeof clientOrderSnapshot === 'object') {
+      // Dev container fallback when server Admin credentials are absent; browser client Firestore already fetched the customer's own order
+      linkedOrderSnapshot = {
+        orderId: cleanOrderId,
+        kitchenId: clientOrderSnapshot.kitchenId,
+        kitchenName: clientOrderSnapshot.kitchenName,
+        riderId: clientOrderSnapshot.riderId,
+        riderName: clientOrderSnapshot.riderName,
+        orderAmount: Number(clientOrderSnapshot.orderAmount) || 0,
+        paymentMethod: clientOrderSnapshot.paymentMethod || 'cod',
+        paymentStatus: clientOrderSnapshot.paymentStatus || 'pending',
+        orderStatus: clientOrderSnapshot.orderStatus || 'pending',
+        itemsSummary: Array.isArray(clientOrderSnapshot.itemsSummary)
+          ? clientOrderSnapshot.itemsSummary
+          : [],
+      };
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  const ticketId = `TKT-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+  const msgId = `msg-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
+  const displayName =
+    (typeof customerName === 'string' && customerName.trim()) ||
+    verifiedUser.name ||
+    verifiedUser.email?.split('@')[0] ||
+    'CookNow Customer';
+  const phoneValue =
+    (typeof customerPhone === 'string' && customerPhone.trim()) ||
+    verifiedUser.phone ||
+    'Not provided';
+
+  const initialMessage = {
+    id: msgId,
+    ticketId,
+    senderRole: 'customer',
+    senderId: verifiedUser.uid,
+    senderName: displayName,
+    body: cleanDescription,
+    createdAt: nowIso,
+  };
+
+  const wantsRefund = Boolean(requestRefund) || category === 'Refund Request';
+
+  const ticket = {
+    id: ticketId,
+    customerId: verifiedUser.uid,
+    customerName: displayName,
+    customerEmail: verifiedUser.email || '',
+    customerPhone: phoneValue,
+    orderId: cleanOrderId,
+    orderSnapshot: linkedOrderSnapshot,
+    category,
+    priority: safePriority,
+    status: 'Open',
+    subject: cleanSubject,
+    description: cleanDescription,
+    assignedAgentId: null,
+    assignedAgentName: null,
+    unreadForOwner: true,
+    unreadForCustomer: false,
+    lastMessagePreview: cleanDescription.slice(0, 120),
+    lastMessageAt: nowIso,
+    messageCount: 1,
+    internalNoteCount: 0,
+    refund: {
+      status: wantsRefund ? 'Requested' : 'None',
+      amount: 0,
+      ...(wantsRefund
+        ? {
+            reason:
+              (typeof refundReason === 'string' && refundReason.trim()) ||
+              cleanSubject,
+            requestedAt: nowIso,
+          }
+        : {}),
+    },
+    satisfactionRating: null,
+    satisfactionFeedback: null,
+    ratedAt: null,
+    history: [
+      {
+        id: `hist-${Date.now()}`,
+        action: 'TICKET_CREATED',
+        actorRole: 'customer',
+        actorName: displayName,
+        timestamp: nowIso,
+        details: cleanOrderId
+          ? `Ticket created (${category}, ${safePriority}) linked to order ${cleanOrderId}`
+          : `Ticket created (${category}, ${safePriority})`,
+      },
+    ],
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    resolvedAt: null,
+    closedAt: null,
+  };
+
+  await saveSupportTicketRecord(ticket);
+  if (hasAdminCredentials && firestoreDb) {
+    await firestoreDb
+      .collection('support_tickets')
+      .doc(ticketId)
+      .collection('messages')
+      .doc(msgId)
+      .set(initialMessage);
+  }
+  LIVE_SUPPORT_MESSAGES_CACHE.set(ticketId, [initialMessage]);
+
+  await persistSupportAuditLog({
+    id: `aud_tkt_create_${ticketId}_${Date.now()}`,
+    action: 'SUPPORT_TICKET_CREATED',
+    targetType: 'support_ticket',
+    targetId: ticketId,
+    actorUid: verifiedUser.uid,
+    actorEmail: verifiedUser.email,
+    actorName: displayName,
+    details: `Support ticket ${ticketId} created under category "${category}" with priority "${safePriority}".`,
+    metadata: { orderId: cleanOrderId, category, priority: safePriority },
+    createdAt: nowIso,
+  });
+
+  return res.status(201).json({
+    success: true,
+    ticket,
+    initialMessage,
+    adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
+  });
+}));
+
+// 13B. Customer Fetch Own Tickets (Strict UID Isolation)
+router.get('/support/my-tickets', asyncHandler(async (req: Request, res: Response) => {
+  const verifiedUser = await extractVerifiedUser(req);
+  if (!verifiedUser) {
+    return res.status(401).json({ success: false, error: 'Authentication required.' });
+  }
+
+  const allTickets = await fetchAllSupportTickets();
+  const myTickets = allTickets.filter((t) => t.customerId === verifiedUser.uid);
+
+  return res.json({
+    success: true,
+    tickets: myTickets,
+    adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
+  });
+}));
+
+// 13C. Owner List All Support Tickets + Live Firestore Stats + Filtering
+router.get('/support/tickets', asyncHandler(async (req: Request, res: Response) => {
+  const verifiedOwner = await requireVerifiedOwner(req, res);
+  if (!verifiedOwner) return;
+
+  const allTickets = await fetchAllSupportTickets();
+  const stats = computeSupportStats(allTickets);
+
+  const search = String(req.query.search || '').trim().toLowerCase();
+  const statusFilter = String(req.query.status || '').trim();
+  const priorityFilter = String(req.query.priority || '').trim();
+  const categoryFilter = String(req.query.category || '').trim();
+  const dateFrom = String(req.query.dateFrom || '').trim();
+  const dateTo = String(req.query.dateTo || '').trim();
+  const unreadOnly = String(req.query.unreadOnly || '') === 'true';
+
+  const filtered = allTickets.filter((t) => {
+    if (statusFilter && statusFilter !== 'all' && t.status !== statusFilter) return false;
+    if (priorityFilter && priorityFilter !== 'all' && t.priority !== priorityFilter) return false;
+    if (categoryFilter && categoryFilter !== 'all' && t.category !== categoryFilter) return false;
+    if (unreadOnly && !t.unreadForOwner) return false;
+
+    if (dateFrom) {
+      const fromMs = new Date(dateFrom).getTime();
+      if (!Number.isNaN(fromMs) && new Date(t.createdAt).getTime() < fromMs) return false;
+    }
+    if (dateTo) {
+      const toDate = new Date(dateTo);
+      toDate.setHours(23, 59, 59, 999);
+      if (!Number.isNaN(toDate.getTime()) && new Date(t.createdAt).getTime() > toDate.getTime()) {
+        return false;
+      }
+    }
+
+    if (search) {
+      const haystack = [
+        t.id,
+        t.customerName,
+        t.customerPhone,
+        t.customerEmail,
+        t.orderId || '',
+        t.subject || '',
+        t.orderSnapshot?.kitchenName || '',
+      ]
+        .join(' ')
+        .toLowerCase();
+      if (!haystack.includes(search)) return false;
+    }
+
+    return true;
+  });
+
+  return res.json({
+    success: true,
+    tickets: filtered,
+    stats,
+    adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
+  });
+}));
+
+// 13D. Fetch Single Ticket Detail (Role-Scoped: Internal Notes & Audit Logs STRICTLY Owner-Only)
+router.get('/support/tickets/:ticketId', asyncHandler(async (req: Request, res: Response) => {
+  const verifiedUser = await extractVerifiedUser(req);
+  if (!verifiedUser) {
+    return res.status(401).json({ success: false, error: 'Authentication required.' });
+  }
+
+  const { ticketId } = req.params;
+  const ticket = await fetchSingleSupportTicket(ticketId);
+  if (!ticket) {
+    return res.status(404).json({ success: false, error: 'Support ticket not found.' });
+  }
+
+  const isOwner = isVerifiedOwnerUser(verifiedUser);
+  if (!isOwner && ticket.customerId !== verifiedUser.uid) {
+    return res.status(403).json({
+      success: false,
+      error: 'Access denied. You can only inspect your own support tickets.',
+    });
+  }
+
+  const markRead = String(req.query.markRead || '') === 'true';
+  if (markRead) {
+    if (isOwner && ticket.unreadForOwner) {
+      ticket.unreadForOwner = false;
+      await saveSupportTicketRecord(ticket);
+    } else if (!isOwner && ticket.unreadForCustomer) {
+      ticket.unreadForCustomer = false;
+      await saveSupportTicketRecord(ticket);
+    }
+  }
+
+  const messages = await fetchSupportTicketMessages(ticketId);
+
+  if (!isOwner) {
+    return res.json({
+      success: true,
+      ticket,
+      messages,
+    });
+  }
+
+  const [internalNotes, linkedOrder] = await Promise.all([
+    fetchSupportTicketInternalNotes(ticketId),
+    ticket.orderId ? fetchSingleOrder(ticket.orderId) : Promise.resolve(null),
+  ]);
+
+  let auditLogs = LIVE_SUPPORT_AUDIT_LOGS_CACHE.get(ticketId) || [];
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      const snap = await firestoreDb
+        .collection('audit_logs')
+        .where('targetId', '==', ticketId)
+        .get();
+      if (!snap.empty) {
+        auditLogs = snap.docs
+          .map((d: any) => ({ id: d.id, ...d.data() }))
+          .sort(
+            (a: any, b: any) =>
+              new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
+          );
+      }
+    } catch {
+      // Non-fatal fallback to in-memory audit cache
+    }
+  }
+
+  return res.json({
+    success: true,
+    ticket,
+    messages,
+    internalNotes,
+    linkedOrder,
+    auditLogs,
+  });
+}));
+
+// 13E. Reply to Ticket (Owning Customer or Verified Owner)
+router.post('/support/tickets/:ticketId/reply', asyncHandler(async (req: Request, res: Response) => {
+  const verifiedUser = await extractVerifiedUser(req);
+  if (!verifiedUser) {
+    return res.status(401).json({ success: false, error: 'Authentication required.' });
+  }
+
+  const { ticketId } = req.params;
+  const ticket = await fetchSingleSupportTicket(ticketId);
+  if (!ticket) {
+    return res.status(404).json({ success: false, error: 'Support ticket not found.' });
+  }
+
+  const isOwner = isVerifiedOwnerUser(verifiedUser);
+  if (!isOwner && ticket.customerId !== verifiedUser.uid) {
+    return res.status(403).json({
+      success: false,
+      error: 'Access denied. You cannot reply to another user’s ticket.',
+    });
+  }
+
+  const bodyText = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
+  if (bodyText.length < 1 || bodyText.length > 3000) {
+    return res.status(400).json({
+      success: false,
+      error: 'Reply message must be between 1 and 3000 characters.',
+    });
+  }
+
+  const nowIso = new Date().toISOString();
+  const senderName = isOwner
+    ? 'Vivek Singh Negi (Owner · Support)'
+    : ticket.customerName || verifiedUser.name || 'Customer';
+  const msg = {
+    id: `msg-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+    ticketId,
+    senderRole: isOwner ? 'owner' : 'customer',
+    senderId: verifiedUser.uid,
+    senderName,
+    body: bodyText,
+    createdAt: nowIso,
+  };
+
+  if (hasAdminCredentials && firestoreDb) {
+    await firestoreDb
+      .collection('support_tickets')
+      .doc(ticketId)
+      .collection('messages')
+      .doc(msg.id)
+      .set(msg);
+  }
+  const existingMsgs = LIVE_SUPPORT_MESSAGES_CACHE.get(ticketId) || [];
+  LIVE_SUPPORT_MESSAGES_CACHE.set(ticketId, [...existingMsgs, msg]);
+
+  // Update ticket state & unread markers
+  if (isOwner) {
+    ticket.unreadForCustomer = true;
+    ticket.unreadForOwner = false;
+    const requestedNextStatus = req.body?.nextStatus;
+    if (requestedNextStatus && SUPPORT_STATUSES.includes(requestedNextStatus)) {
+      ticket.status = requestedNextStatus;
+      if (
+        (requestedNextStatus === 'Resolved' || requestedNextStatus === 'Closed') &&
+        !ticket.resolvedAt
+      ) {
+        ticket.resolvedAt = nowIso;
+      }
+      if (requestedNextStatus === 'Closed' && !ticket.closedAt) {
+        ticket.closedAt = nowIso;
+      }
+    } else if (ticket.status === 'Open') {
+      ticket.status = 'In Progress';
+    }
+  } else {
+    ticket.unreadForOwner = true;
+    ticket.unreadForCustomer = false;
+    if (ticket.status === 'Waiting for Customer') {
+      ticket.status = 'In Progress';
+    }
+  }
+
+  ticket.lastMessagePreview = bodyText.slice(0, 120);
+  ticket.lastMessageAt = nowIso;
+  ticket.messageCount = Number(ticket.messageCount || 0) + 1;
+  ticket.updatedAt = nowIso;
+  ticket.history = [
+    ...(Array.isArray(ticket.history) ? ticket.history : []),
+    {
+      id: `hist-${Date.now()}-${crypto.randomBytes(1).toString('hex')}`,
+      action: isOwner ? 'OWNER_REPLIED' : 'CUSTOMER_REPLIED',
+      actorRole: isOwner ? 'owner' : 'customer',
+      actorName: senderName,
+      timestamp: nowIso,
+      details: `${isOwner ? 'Support team' : 'Customer'} sent a reply in the ticket thread.`,
+    },
+  ];
+
+  await saveSupportTicketRecord(ticket);
+
+  return res.json({
+    success: true,
+    message: msg,
+    ticket,
+    channelNote:
+      'Reply saved to Firestore support thread. External SMS, WhatsApp, Email, and Push notifications are not integrated.',
+  });
+}));
+
+// 13F. Staff-Only Internal Notes (Strictly Owner-Only; Never Visible to Customers)
+router.post('/support/tickets/:ticketId/internal-notes', asyncHandler(async (req: Request, res: Response) => {
+  const verifiedOwner = await requireVerifiedOwner(req, res);
+  if (!verifiedOwner) return;
+
+  const { ticketId } = req.params;
+  const ticket = await fetchSingleSupportTicket(ticketId);
+  if (!ticket) {
+    return res.status(404).json({ success: false, error: 'Support ticket not found.' });
+  }
+
+  const bodyText = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
+  if (bodyText.length < 1 || bodyText.length > 3000) {
+    return res.status(400).json({
+      success: false,
+      error: 'Internal note must be between 1 and 3000 characters.',
+    });
+  }
+
+  const nowIso = new Date().toISOString();
+  const note = {
+    id: `note-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+    ticketId,
+    authorId: verifiedOwner.uid,
+    authorName: verifiedOwner.name || 'Vivek Singh Negi',
+    authorEmail: verifiedOwner.email,
+    body: bodyText,
+    createdAt: nowIso,
+  };
+
+  if (hasAdminCredentials && firestoreDb) {
+    await firestoreDb
+      .collection('support_tickets')
+      .doc(ticketId)
+      .collection('internal_notes')
+      .doc(note.id)
+      .set(note);
+  }
+  const existingNotes = LIVE_SUPPORT_INTERNAL_NOTES_CACHE.get(ticketId) || [];
+  LIVE_SUPPORT_INTERNAL_NOTES_CACHE.set(ticketId, [...existingNotes, note]);
+
+  // Do NOT put private note text into customer-readable history; only record count & timestamp
+  ticket.internalNoteCount = Number(ticket.internalNoteCount || 0) + 1;
+  ticket.updatedAt = nowIso;
+  await saveSupportTicketRecord(ticket);
+
+  await persistSupportAuditLog({
+    id: `aud_note_${note.id}`,
+    action: 'SUPPORT_INTERNAL_NOTE_ADDED',
+    targetType: 'support_ticket',
+    targetId: ticketId,
+    actorUid: verifiedOwner.uid,
+    actorEmail: verifiedOwner.email,
+    actorName: verifiedOwner.name || 'Vivek Singh Negi',
+    details: 'Staff-only internal note added.',
+    createdAt: nowIso,
+  });
+
+  return res.status(201).json({
+    success: true,
+    note,
+    ticket,
+  });
+}));
+
+// 13G. Owner Update Ticket Status, Priority, or Assignee
+router.patch('/support/tickets/:ticketId', asyncHandler(async (req: Request, res: Response) => {
+  const verifiedOwner = await requireVerifiedOwner(req, res);
+  if (!verifiedOwner) return;
+
+  const { ticketId } = req.params;
+  const ticket = await fetchSingleSupportTicket(ticketId);
+  if (!ticket) {
+    return res.status(404).json({ success: false, error: 'Support ticket not found.' });
+  }
+
+  const { status, priority, assignedAgentId, assignedAgentName, markReadByOwner } = req.body || {};
+  const nowIso = new Date().toISOString();
+  const actorName = 'Vivek Singh Negi (Owner)';
+  const historyEvents: any[] = [];
+
+  if (status !== undefined) {
+    if (!SUPPORT_STATUSES.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid status. Allowed values: ${SUPPORT_STATUSES.join(', ')}`,
+      });
+    }
+    if (status !== ticket.status) {
+      const prevStatus = ticket.status;
+      ticket.status = status;
+      if (status === 'Resolved') {
+        ticket.resolvedAt = ticket.resolvedAt || nowIso;
+        ticket.closedAt = null;
+      } else if (status === 'Closed') {
+        ticket.resolvedAt = ticket.resolvedAt || nowIso;
+        ticket.closedAt = nowIso;
+      } else {
+        ticket.resolvedAt = null;
+        ticket.closedAt = null;
+      }
+      historyEvents.push({
+        id: `hist-${Date.now()}-${crypto.randomBytes(1).toString('hex')}`,
+        action: 'STATUS_CHANGED',
+        actorRole: 'owner',
+        actorName,
+        timestamp: nowIso,
+        details: `Ticket status changed from "${prevStatus}" to "${status}".`,
+      });
+    }
+  }
+
+  if (priority !== undefined) {
+    if (!SUPPORT_PRIORITIES.includes(priority)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid priority. Allowed values: ${SUPPORT_PRIORITIES.join(', ')}`,
+      });
+    }
+    if (priority !== ticket.priority) {
+      const prevPriority = ticket.priority;
+      ticket.priority = priority;
+      historyEvents.push({
+        id: `hist-${Date.now()}-${crypto.randomBytes(1).toString('hex')}`,
+        action: 'PRIORITY_CHANGED',
+        actorRole: 'owner',
+        actorName,
+        timestamp: nowIso,
+        details: `Priority updated from "${prevPriority}" to "${priority}".`,
+      });
+    }
+  }
+
+  if (assignedAgentName !== undefined || assignedAgentId !== undefined) {
+    const cleanAgentName =
+      typeof assignedAgentName === 'string' && assignedAgentName.trim()
+        ? assignedAgentName.trim().slice(0, 120)
+        : null;
+    const cleanAgentId =
+      typeof assignedAgentId === 'string' && assignedAgentId.trim()
+        ? assignedAgentId.trim().slice(0, 100)
+        : null;
+
+    if (cleanAgentName !== ticket.assignedAgentName || cleanAgentId !== ticket.assignedAgentId) {
+      ticket.assignedAgentId = cleanAgentId;
+      ticket.assignedAgentName = cleanAgentName;
+      historyEvents.push({
+        id: `hist-${Date.now()}-${crypto.randomBytes(1).toString('hex')}`,
+        action: 'ASSIGNEE_UPDATED',
+        actorRole: 'owner',
+        actorName,
+        timestamp: nowIso,
+        details: cleanAgentName
+          ? `Assigned ticket to ${cleanAgentName}.`
+          : 'Unassigned ticket.',
+      });
+    }
+  }
+
+  if (markReadByOwner === true) {
+    ticket.unreadForOwner = false;
+  }
+
+  ticket.updatedAt = nowIso;
+  if (historyEvents.length > 0) {
+    ticket.history = [...(Array.isArray(ticket.history) ? ticket.history : []), ...historyEvents];
+  }
+
+  await saveSupportTicketRecord(ticket);
+
+  if (historyEvents.length > 0) {
+    await persistSupportAuditLog({
+      id: `aud_tkt_upd_${ticketId}_${Date.now()}`,
+      action: 'SUPPORT_TICKET_UPDATED',
+      targetType: 'support_ticket',
+      targetId: ticketId,
+      actorUid: verifiedOwner.uid,
+      actorEmail: verifiedOwner.email,
+      actorName,
+      details: historyEvents.map((e) => e.details).join(' '),
+      metadata: {
+        status: ticket.status,
+        priority: ticket.priority,
+        assignedAgentName: ticket.assignedAgentName,
+      },
+      createdAt: nowIso,
+    });
+  }
+
+  return res.json({
+    success: true,
+    ticket,
+  });
+}));
+
+// 13H. Owner Refund Decision & Manual Settlement Confirmation
+router.post('/support/tickets/:ticketId/refund', asyncHandler(async (req: Request, res: Response) => {
+  const verifiedOwner = await requireVerifiedOwner(req, res);
+  if (!verifiedOwner) return;
+
+  const { ticketId } = req.params;
+  const ticket = await fetchSingleSupportTicket(ticketId);
+  if (!ticket) {
+    return res.status(404).json({ success: false, error: 'Support ticket not found.' });
+  }
+
+  const {
+    status: nextRefundStatus,
+    amount,
+    reason,
+    settlementReference,
+    manualConfirmationChecked,
+  } = req.body || {};
+
+  if (
+    !nextRefundStatus ||
+    !SUPPORT_REFUND_STATUSES.includes(nextRefundStatus) ||
+    nextRefundStatus === 'None'
+  ) {
+    return res.status(400).json({
+      success: false,
+      error: 'Refund status must be one of: Requested, Approved, Rejected, Processed.',
+    });
+  }
+
+  const cleanReason = typeof reason === 'string' ? reason.trim() : '';
+  if (cleanReason.length < 3 || cleanReason.length > 500) {
+    return res.status(400).json({
+      success: false,
+      error: 'A clear refund decision reason (3–500 characters) is required.',
+    });
+  }
+
+  const numericAmount = Number(amount || 0);
+  if (nextRefundStatus !== 'Rejected' && (!Number.isFinite(numericAmount) || numericAmount <= 0)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Refund amount must be greater than ₹0 for Requested, Approved, or Processed refunds.',
+    });
+  }
+
+  if (nextRefundStatus === 'Rejected' && (!Number.isFinite(numericAmount) || numericAmount < 0)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid refund amount.',
+    });
+  }
+
+  // Cap refund against linked order total if available
+  let maxOrderAmount: number | null = null;
+  if (ticket.orderId) {
+    const linkedOrder = await fetchSingleOrder(ticket.orderId);
+    if (linkedOrder && Number.isFinite(Number(linkedOrder.finalPayableAmount))) {
+      maxOrderAmount = Number(linkedOrder.finalPayableAmount);
+    } else if (
+      ticket.orderSnapshot &&
+      Number.isFinite(Number(ticket.orderSnapshot.orderAmount)) &&
+      Number(ticket.orderSnapshot.orderAmount) > 0
+    ) {
+      maxOrderAmount = Number(ticket.orderSnapshot.orderAmount);
+    }
+  }
+
+  if (maxOrderAmount !== null && numericAmount > maxOrderAmount) {
+    return res.status(400).json({
+      success: false,
+      error: `Refund amount ₹${numericAmount} cannot exceed linked order total ₹${maxOrderAmount}.`,
+    });
+  }
+
+  const currentRefundStatus = ticket.refund?.status || 'None';
+  if (nextRefundStatus === 'Processed') {
+    if (currentRefundStatus === 'Rejected') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot mark a rejected refund as Processed. Record a new Approved decision first.',
+      });
+    }
+    const cleanRef = typeof settlementReference === 'string' ? settlementReference.trim() : '';
+    if (!manualConfirmationChecked || cleanRef.length < 3) {
+      return res.status(400).json({
+        success: false,
+        error:
+          'Refund cannot be marked Processed without explicit manual completion confirmation and a settlement/UPI/cash reference note (at least 3 characters).',
+      });
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  const prevRefund = ticket.refund || { status: 'None', amount: 0 };
+  const cleanRef = typeof settlementReference === 'string' ? settlementReference.trim() : prevRefund.settlementReference;
+
+  const updatedRefund = {
+    status: nextRefundStatus,
+    amount: nextRefundStatus === 'Rejected' ? 0 : Math.round(numericAmount),
+    reason: cleanReason,
+    requestedAt: prevRefund.requestedAt || nowIso,
+    decidedAt:
+      nextRefundStatus === 'Approved' || nextRefundStatus === 'Rejected'
+        ? nowIso
+        : prevRefund.decidedAt || nowIso,
+    processedAt: nextRefundStatus === 'Processed' ? nowIso : undefined,
+    responsibleAdmin: `Vivek Singh Negi (${verifiedOwner.email})`,
+    settlementReference: cleanRef || undefined,
+    manualConfirmationChecked: nextRefundStatus === 'Processed' ? Boolean(manualConfirmationChecked) : false,
+  };
+
+  ticket.refund = updatedRefund;
+  ticket.updatedAt = nowIso;
+  ticket.unreadForCustomer = true;
+  ticket.history = [
+    ...(Array.isArray(ticket.history) ? ticket.history : []),
+    {
+      id: `hist-${Date.now()}-${crypto.randomBytes(1).toString('hex')}`,
+      action: `REFUND_${nextRefundStatus.toUpperCase()}`,
+      actorRole: 'owner',
+      actorName: 'Vivek Singh Negi (Owner)',
+      timestamp: nowIso,
+      details:
+        nextRefundStatus === 'Processed'
+          ? `Refund marked Processed (₹${updatedRefund.amount}) · Manual settlement ref: ${cleanRef} · Reason: ${cleanReason}`
+          : nextRefundStatus === 'Rejected'
+          ? `Refund request Rejected · Reason: ${cleanReason}`
+          : `Refund set to ${nextRefundStatus} (₹${updatedRefund.amount}) · Reason: ${cleanReason}`,
+    },
+  ];
+
+  await saveSupportTicketRecord(ticket);
+
+  await persistSupportAuditLog({
+    id: `aud_ref_${ticketId}_${Date.now()}`,
+    action: `SUPPORT_REFUND_${nextRefundStatus.toUpperCase()}`,
+    targetType: 'support_ticket',
+    targetId: ticketId,
+    actorUid: verifiedOwner.uid,
+    actorEmail: verifiedOwner.email,
+    actorName: 'Vivek Singh Negi',
+    details: `Refund status updated from "${prevRefund.status}" to "${nextRefundStatus}" (₹${updatedRefund.amount}). Reason: ${cleanReason}`,
+    metadata: {
+      previousStatus: prevRefund.status,
+      newStatus: nextRefundStatus,
+      amount: updatedRefund.amount,
+      settlementReference: cleanRef || null,
+      orderId: ticket.orderId || null,
+    },
+    createdAt: nowIso,
+  });
+
+  return res.json({
+    success: true,
+    ticket,
+    refund: updatedRefund,
+  });
+}));
+
+// 13I. Customer Satisfaction (CSAT) Submission (Strict Owning Customer + Resolved/Closed Only)
+router.post('/support/tickets/:ticketId/csat', asyncHandler(async (req: Request, res: Response) => {
+  const verifiedUser = await extractVerifiedUser(req);
+  if (!verifiedUser) {
+    return res.status(401).json({ success: false, error: 'Authentication required.' });
+  }
+
+  const { ticketId } = req.params;
+  const ticket = await fetchSingleSupportTicket(ticketId);
+  if (!ticket) {
+    return res.status(404).json({ success: false, error: 'Support ticket not found.' });
+  }
+
+  if (ticket.customerId !== verifiedUser.uid) {
+    return res.status(403).json({
+      success: false,
+      error: 'Only the customer who opened this ticket can submit a satisfaction rating.',
+    });
+  }
+
+  if (ticket.status !== 'Resolved' && ticket.status !== 'Closed') {
+    return res.status(400).json({
+      success: false,
+      error: 'Customer satisfaction rating can only be submitted once the ticket is Resolved or Closed.',
+    });
+  }
+
+  const numericRating = Number(req.body?.rating);
+  if (!Number.isInteger(numericRating) || numericRating < 1 || numericRating > 5) {
+    return res.status(400).json({
+      success: false,
+      error: 'Rating must be an integer between 1 and 5.',
+    });
+  }
+
+  const cleanFeedback =
+    typeof req.body?.feedback === 'string' ? req.body.feedback.trim().slice(0, 1000) : null;
+  const nowIso = new Date().toISOString();
+
+  ticket.satisfactionRating = numericRating;
+  ticket.satisfactionFeedback = cleanFeedback;
+  ticket.ratedAt = nowIso;
+  ticket.updatedAt = nowIso;
+  ticket.history = [
+    ...(Array.isArray(ticket.history) ? ticket.history : []),
+    {
+      id: `hist-${Date.now()}`,
+      action: 'CSAT_SUBMITTED',
+      actorRole: 'customer',
+      actorName: ticket.customerName || 'Customer',
+      timestamp: nowIso,
+      details: `Customer rated resolution ${numericRating}/5 stars.${cleanFeedback ? ` Feedback: "${cleanFeedback}"` : ''}`,
+    },
+  ];
+
+  await saveSupportTicketRecord(ticket);
+
+  return res.json({
+    success: true,
+    ticket,
+  });
+}));
+
+// ------------------------------------------------------------------------------
 // SERVER INITIALIZATION & LIFECYCLE
 // ------------------------------------------------------------------------------
 

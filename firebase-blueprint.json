@@ -1,0 +1,92 @@
+{
+  "entities": {
+    "SupportTicket": {
+      "title": "SupportTicket",
+      "description": "Customer complaint and support ticket persisted in Cloud Firestore and optionally linked to an Order",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "customerId": { "type": "string" },
+        "customerName": { "type": "string" },
+        "customerEmail": { "type": "string" },
+        "customerPhone": { "type": "string" },
+        "orderId": { "type": ["string", "null"] },
+        "category": { "type": "string" },
+        "priority": { "type": "string", "enum": ["Low", "Medium", "High", "Urgent"] },
+        "status": {
+          "type": "string",
+          "enum": ["Open", "In Progress", "Waiting for Customer", "Resolved", "Closed"]
+        },
+        "subject": { "type": "string" },
+        "description": { "type": "string" },
+        "assignedAgentId": { "type": ["string", "null"] },
+        "assignedAgentName": { "type": ["string", "null"] },
+        "unreadForOwner": { "type": "boolean" },
+        "unreadForCustomer": { "type": "boolean" },
+        "messageCount": { "type": "number" },
+        "refund": { "type": "object" },
+        "satisfactionRating": { "type": ["number", "null"] },
+        "satisfactionFeedback": { "type": ["string", "null"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "resolvedAt": { "type": ["string", "null"], "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "customerId",
+        "customerName",
+        "category",
+        "priority",
+        "status",
+        "subject",
+        "description",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SupportMessage": {
+      "title": "SupportMessage",
+      "description": "Public communication message between a customer and CookNow Owner/Support",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "ticketId": { "type": "string" },
+        "senderRole": { "type": "string", "enum": ["customer", "owner"] },
+        "senderId": { "type": "string" },
+        "senderName": { "type": "string" },
+        "body": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ticketId", "senderRole", "senderId", "senderName", "body", "createdAt"]
+    },
+    "SupportInternalNote": {
+      "title": "SupportInternalNote",
+      "description": "Private staff-only note visible strictly to verified Owner/Admin accounts",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "ticketId": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "authorEmail": { "type": "string" },
+        "body": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ticketId", "authorId", "authorName", "authorEmail", "body", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/support_tickets/{ticketId}": {
+      "schema": { "$ref": "#/entities/SupportTicket" },
+      "description": "Customer Care support tickets with order links, refund decisions, CSAT, and ticket history"
+    },
+    "/support_tickets/{ticketId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/SupportMessage" },
+      "description": "Public customer-owner reply thread for a support ticket"
+    },
+    "/support_tickets/{ticketId}/internal_notes/{noteId}": {
+      "schema": { "$ref": "#/entities/SupportInternalNote" },
+      "description": "Staff-only internal notes isolated from customer read access"
+    }
+  }
+}

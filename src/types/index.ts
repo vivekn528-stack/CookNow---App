@@ -370,3 +370,151 @@ export interface Address {
   pincode: string;
   isDefault: boolean;
 }
+
+export const SUPPORT_TICKET_CATEGORIES = [
+  'Order Not Delivered',
+  'Late Delivery',
+  'Wrong Food Item',
+  'Missing Item',
+  'Food Quality Complaint',
+  'Refund Request',
+  'Payment / COD Issue',
+  'Coupon / Discount Issue',
+  'Kitchen / Cook Complaint',
+  'Rider Behaviour',
+  'Account / Login Issue',
+  'Other',
+] as const;
+
+export type SupportTicketCategory = (typeof SUPPORT_TICKET_CATEGORIES)[number];
+
+export const SUPPORT_TICKET_STATUSES = [
+  'Open',
+  'In Progress',
+  'Waiting for Customer',
+  'Resolved',
+  'Closed',
+] as const;
+
+export type SupportTicketStatus = (typeof SUPPORT_TICKET_STATUSES)[number];
+
+export const SUPPORT_TICKET_PRIORITIES = ['Low', 'Medium', 'High', 'Urgent'] as const;
+
+export type SupportTicketPriority = (typeof SUPPORT_TICKET_PRIORITIES)[number];
+
+export const SUPPORT_REFUND_STATUSES = [
+  'None',
+  'Requested',
+  'Approved',
+  'Rejected',
+  'Processed',
+] as const;
+
+export type SupportRefundStatus = (typeof SUPPORT_REFUND_STATUSES)[number];
+
+export interface SupportRefundInfo {
+  status: SupportRefundStatus;
+  amount: number;
+  reason?: string;
+  requestedAt?: string;
+  decidedAt?: string;
+  processedAt?: string;
+  responsibleAdmin?: string;
+  settlementReference?: string;
+  manualConfirmationChecked?: boolean;
+}
+
+export interface SupportMessage {
+  id: string;
+  ticketId: string;
+  senderRole: 'customer' | 'owner';
+  senderId: string;
+  senderName: string;
+  body: string;
+  createdAt: string;
+}
+
+export interface SupportInternalNote {
+  id: string;
+  ticketId: string;
+  authorId: string;
+  authorName: string;
+  authorEmail: string;
+  body: string;
+  createdAt: string;
+}
+
+export interface SupportHistoryEvent {
+  id: string;
+  action: string;
+  actorRole: 'customer' | 'owner' | 'system';
+  actorName: string;
+  timestamp: string;
+  details: string;
+}
+
+export interface SupportOrderSnapshot {
+  orderId: string;
+  kitchenId?: string;
+  kitchenName?: string;
+  riderId?: string;
+  riderName?: string;
+  riderPhone?: string;
+  orderAmount?: number;
+  paymentMethod?: PaymentMethod;
+  paymentStatus?: PaymentStatus;
+  orderStatus?: OrderStatus;
+  itemsSummary?: {
+    itemName: string;
+    quantity: number;
+    unitPrice: number;
+    subtotal: number;
+  }[];
+}
+
+export interface SupportTicket {
+  id: string;
+  customerId: string;
+  customerName: string;
+  customerEmail: string;
+  customerPhone: string;
+  orderId?: string | null;
+  orderSnapshot?: SupportOrderSnapshot | null;
+  category: SupportTicketCategory;
+  priority: SupportTicketPriority;
+  status: SupportTicketStatus;
+  subject: string;
+  description: string;
+  assignedAgentId?: string | null;
+  assignedAgentName?: string | null;
+  unreadForOwner: boolean;
+  unreadForCustomer: boolean;
+  lastMessagePreview?: string;
+  lastMessageAt?: string;
+  messageCount: number;
+  internalNoteCount?: number;
+  refund: SupportRefundInfo;
+  satisfactionRating?: number | null;
+  satisfactionFeedback?: string | null;
+  ratedAt?: string | null;
+  history: SupportHistoryEvent[];
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string | null;
+  closedAt?: string | null;
+}
+
+export interface SupportTicketStats {
+  totalTickets: number;
+  openTickets: number;
+  inProgressTickets: number;
+  waitingForCustomerTickets: number;
+  resolvedTickets: number;
+  closedTickets: number;
+  urgentActiveTickets: number;
+  unreadForOwnerCount: number;
+  avgResolutionMinutes: number | null;
+  avgSatisfactionRating: number | null;
+  satisfactionResponseCount: number;
+}
+

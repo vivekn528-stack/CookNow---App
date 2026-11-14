@@ -38,6 +38,7 @@ import {
   Check,
   ChevronRight,
   FileText,
+  Headphones,
 } from 'lucide-react';
 import {
   Cook,
@@ -53,9 +54,12 @@ import {
   Complaint,
   OperatingExpense,
   ExpenseCategory,
+  SupportTicketStats,
 } from '../types';
 import { OWNER_PROFILE, StorageManager } from '../lib/storage';
 import { firestoreService } from '../lib/firestore';
+import { supportService } from '../lib/support-service';
+import { CustomerCareTab } from './CustomerCareTab';
 import { getFirebaseAuth } from '../lib/firebase';
 import {
   executeStage1PublicImport,
@@ -78,7 +82,8 @@ export type AdminDashboardTab =
   | 'subscriptions'
   | 'settlements'
   | 'reports'
-  | 'settings';
+  | 'settings'
+  | 'customer-care';
 
 export type TimeRangeFilter = 'today' | 'yesterday' | '7d' | '30d' | 'this_month' | 'prev_month' | 'all';
 
@@ -221,7 +226,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [reversingExpenseId, setReversingExpenseId] = useState<string | null>(null);
   const [reversalReasonInput, setReversalReasonInput] = useState('');
 
-  // Fetch persisted settlements from Cloud Firestore on mount
+  // Customer Care summary badge state
+  const [supportStats, setSupportStats] = useState<SupportTicketStats | null>(null);
+
+  // Fetch persisted settlements & support ticket badge stats from Cloud Firestore on mount
   useEffect(() => {
     let isMounted = true;
     firestoreService.fetchSettlements().then((res) => {
@@ -240,6 +248,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     }).catch(() => {
       // Non-fatal
     });
+
+    supportService.fetchOwnerTickets().then((res) => {
+      if (isMounted) {
+        setSupportStats(res.stats);
+      }
+    }).catch(() => {
+      // Non-fatal until tab opened
+    });
+
     return () => { isMounted = false; };
   }, []);
 
@@ -1017,6 +1034,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             ['settlements', '13. Settlements', CreditCard],
             ['reports', '14. Reports', Download],
             ['settings', '15. Settings', Settings],
+            [
+              'customer-care',
+              `16. Customer Care & Support Centre${
+                supportStats
+                  ? ` (${supportStats.openTickets + supportStats.inProgressTickets + supportStats.waitingForCustomerTickets})`
+                  : ''
+              }`,
+              Headphones,
+            ],
           ] as const
         ).map(([key, label, Icon]) => (
           <button
@@ -2827,6 +2853,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* ====================================================================== */}
+      {/* SECTION 16: CUSTOMER CARE & SUPPORT CENTRE                             */}
+      {/* ====================================================================== */}
+      {activeTab === 'customer-care' && (
+        <CustomerCareTab
+          orders={orders}
+          onInspectOrder={(order) => setSelectedOrder(order)}
+          onStatsChange={setSupportStats}
+        />
       )}
 
       {/* ---------------------------------------------------------------------- */}

@@ -71,6 +71,7 @@ import { DeliveryPartnerModal } from './components/DeliveryPartnerModal';
 import { OwnerAuthModal } from './components/OwnerAuthModal';
 import { DatabaseGuideModal } from './components/DatabaseGuideModal';
 import { SupabaseConfigModal } from './components/SupabaseConfigModal';
+import { CustomerSupportModal } from './components/CustomerSupportModal';
 
 export default function App() {
   // Backend Integration State (Firebase Cloud Firestore Single Source of Truth)
@@ -148,6 +149,8 @@ export default function App() {
   const [trackedOrder, setTrackedOrder] = useState<Order | null>(null);
   const [reviewOrder, setReviewOrder] = useState<Order | null>(null);
   const [isDbGuideOpen, setIsDbGuideOpen] = useState(false);
+  const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
+  const [supportInitialOrder, setSupportInitialOrder] = useState<Order | null>(null);
 
   // Filters & Search
   const [searchQuery, setSearchQuery] = useState('');
@@ -1483,6 +1486,10 @@ export default function App() {
               setIsCartOpen(true);
             }}
             onBrowseMeals={() => setActiveTab('explore')}
+            onOpenSupport={(ord) => {
+              setSupportInitialOrder(ord || null);
+              setIsSupportModalOpen(true);
+            }}
             currentUser={currentFirebaseUser}
             onSignIn={handleCustomerGoogleSignIn}
           />
@@ -1757,6 +1764,20 @@ export default function App() {
         }}
       />
 
+      {/* Customer Care & Help Desk Modal */}
+      <CustomerSupportModal
+        isOpen={isSupportModalOpen}
+        onClose={() => {
+          setIsSupportModalOpen(false);
+          setSupportInitialOrder(null);
+        }}
+        orders={orders}
+        initialOrder={supportInitialOrder}
+        currentUser={currentFirebaseUser}
+        onSignIn={handleCustomerGoogleSignIn}
+        onNotify={showToast}
+      />
+
       {/* Clean Footer */}
       <footer className="mt-16 bg-stone-900 text-stone-400 border-t border-stone-800 text-xs">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-6">
@@ -1825,9 +1846,22 @@ export default function App() {
             <span>
               © {new Date().getFullYear()} CookNow Technologies Pvt. Ltd. · Nalapani Chowk, Dehradun, Uttarakhand, India.
             </span>
-            <span>
-              Support: {settings.supportEmail} · {settings.supportPhone}
-            </span>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setSupportInitialOrder(null);
+                  setIsSupportModalOpen(true);
+                }}
+                className="text-emerald-400 hover:text-emerald-300 font-semibold underline underline-offset-4 cursor-pointer"
+              >
+                Customer Care &amp; Support
+              </button>
+              <span>·</span>
+              <span>
+                Support: {settings.supportEmail} · {settings.supportPhone}
+              </span>
+            </div>
           </div>
         </div>
       </footer>

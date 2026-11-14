@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Clock, Eye, Star, RotateCcw, AlertCircle, ShoppingBag, CheckCircle2, LogIn } from 'lucide-react';
+import { Clock, Eye, Star, RotateCcw, AlertCircle, ShoppingBag, CheckCircle2, LogIn, Headphones } from 'lucide-react';
 import { Order, MenuItem } from '../types';
 import { getMenuItemImage, getMenuItemAlt, FALLBACK_MEAL_IMAGE } from '../lib/image-registry';
 
@@ -9,6 +9,7 @@ interface CustomerOrdersViewProps {
   onOpenReview: (order: Order) => void;
   onReorder: (order: Order) => void;
   onBrowseMeals: () => void;
+  onOpenSupport?: (order?: Order) => void;
   currentUser?: { uid: string; email?: string | null; displayName?: string | null } | null;
   onSignIn?: () => void;
 }
@@ -19,6 +20,7 @@ export const CustomerOrdersView: React.FC<CustomerOrdersViewProps> = ({
   onOpenReview,
   onReorder,
   onBrowseMeals,
+  onOpenSupport,
   currentUser,
   onSignIn,
 }) => {
@@ -86,8 +88,20 @@ export const CustomerOrdersView: React.FC<CustomerOrdersViewProps> = ({
           </p>
         </div>
 
-        {/* Filter Segmented Buttons */}
-        <div className="flex items-center gap-1 p-1 bg-stone-100 rounded-lg border border-stone-200/80 self-start">
+        <div className="flex flex-wrap items-center gap-2 self-start">
+          {onOpenSupport && (
+            <button
+              type="button"
+              onClick={() => onOpenSupport()}
+              className="px-3 py-1.5 bg-white hover:bg-stone-50 text-emerald-900 border border-emerald-200 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
+            >
+              <Headphones className="w-3.5 h-3.5 text-emerald-800" />
+              <span>Support &amp; Help</span>
+            </button>
+          )}
+
+          {/* Filter Segmented Buttons */}
+          <div className="flex items-center gap-1 p-1 bg-stone-100 rounded-lg border border-stone-200/80">
           <button
             onClick={() => setFilter('all')}
             className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${
@@ -118,6 +132,7 @@ export const CustomerOrdersView: React.FC<CustomerOrdersViewProps> = ({
           >
             Completed
           </button>
+        </div>
         </div>
       </div>
 
@@ -239,6 +254,18 @@ export const CustomerOrdersView: React.FC<CustomerOrdersViewProps> = ({
                       >
                         <Star className="w-3.5 h-3.5 fill-amber-400 text-amber-500" />
                         <span>Leave Review</span>
+                      </button>
+                    )}
+
+                    {onOpenSupport && (
+                      <button
+                        type="button"
+                        onClick={() => onOpenSupport(order)}
+                        className="px-3 py-1.5 bg-white hover:bg-emerald-50 text-emerald-900 border border-emerald-200 text-xs font-semibold rounded-lg flex items-center gap-1 transition-colors cursor-pointer"
+                        title="Raise a complaint or refund request for this order"
+                      >
+                        <Headphones className="w-3.5 h-3.5" />
+                        <span>Need Help</span>
                       </button>
                     )}
 
