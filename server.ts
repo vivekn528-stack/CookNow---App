@@ -1,4 +1,8 @@
-import app, { verifyFirebaseIdToken, type VerifiedFirebaseUser } from './api/index';
+import app, {
+  verifyFirebaseIdToken,
+  hasAdminCredentials,
+  type VerifiedFirebaseUser,
+} from './api/index';
 import { createServer as createViteServer } from 'vite';
 import express, { Request, Response } from 'express';
 
@@ -57,5 +61,5 @@ if (isMainModule && !process.env.VERCEL) {
   });
 }
 
-export { verifyFirebaseIdToken, type VerifiedFirebaseUser };
+export { verifyFirebaseIdToken, hasAdminCredentials, type VerifiedFirebaseUser };
 export default app;

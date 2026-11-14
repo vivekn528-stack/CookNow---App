@@ -6,31 +6,14 @@ import crypto from 'node:crypto';
 import { promises as dnsPromises } from 'dns';
 import { createClient } from '@supabase/supabase-js';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
-import { initializeApp, getApps } from 'firebase-admin/app';
+import { initializeApp, getApps, cert, type ServiceAccount } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 
 dotenv.config();
 
-// Override from supabase.config.json if present
-try {
-  const configPath = path.resolve(process.cwd(), 'supabase.config.json');
-  if (fs.existsSync(configPath)) {
-    const raw = fs.readFileSync(configPath, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed.url && parsed.url.startsWith('http')) {
-      process.env.VITE_SUPABASE_URL = parsed.url;
-    }
-    if (parsed.anonKey && parsed.anonKey.length > 20) {
-      process.env.VITE_SUPABASE_ANON_KEY = parsed.anonKey;
-    }
-  }
-} catch (e) {
-  // Non-fatal
-}
-
 const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 
-// Ensure public client environment variables are synced to .env (local dev only)
+// Ensure public Firebase Web App client environment variables are synced to .env (local dev only)
 if (!isServerless) {
   try {
     const envPath = path.resolve(process.cwd(), '.env');
@@ -41,8 +24,6 @@ if (!isServerless) {
       'VITE_FIREBASE_PROJECT_ID',
       'VITE_FIREBASE_STORAGE_BUCKET',
       'VITE_FIREBASE_MESSAGING_SENDER_ID',
-      'VITE_SUPABASE_URL',
-      'VITE_SUPABASE_ANON_KEY',
     ];
     let envLines: string[] = [];
     if (fs.existsSync(envPath)) {
@@ -51,9 +32,6 @@ if (!isServerless) {
     }
     for (const k of publicKeys) {
       if (process.env[k]) {
-        if (k === 'VITE_SUPABASE_URL' && process.env[k]?.startsWith('sb_publishable_')) {
-          continue;
-        }
         envLines.push(`${k}="${process.env[k]}"`);
       }
     }
@@ -148,11 +126,56 @@ async function extractVerifiedUser(req: Request): Promise<VerifiedFirebaseUser |
 
 // ------------------------------------------------------------------------------
 // FIREBASE ADMIN SDK & CUSTOM FIRESTORE DB INITIALIZATION
+// Reads server-only credentials from environment variables (never VITE_ prefixed)
 // ------------------------------------------------------------------------------
-const adminApp =
-  getApps().length > 0 ? getApps()[0] : initializeApp({ projectId: FIREBASE_PROJECT_ID });
 const CUSTOM_FIRESTORE_DB_ID =
   'ai-studio-cooknowhomestyle-7c8332e7-39bc-4862-8a92-262d83edb331';
+
+function resolveFirebaseServiceAccount(): ServiceAccount | null {
+  const rawJson = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
+  if (rawJson) {
+    try {
+      const decoded = rawJson.startsWith('{')
+        ? rawJson
+        : Buffer.from(rawJson, 'base64').toString('utf8');
+      const parsed = JSON.parse(decoded);
+      if (parsed && parsed.client_email && parsed.private_key) {
+        return {
+          projectId: parsed.project_id || FIREBASE_PROJECT_ID,
+          clientEmail: parsed.client_email,
+          privateKey: String(parsed.private_key).replace(/\\n/g, '\n'),
+        };
+      }
+    } catch {
+      console.warn('[Firebase Admin] Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON.');
+    }
+  }
+
+  const clientEmail = (process.env.FIREBASE_CLIENT_EMAIL || '').trim();
+  const privateKey = (process.env.FIREBASE_PRIVATE_KEY || '').trim();
+  if (clientEmail && privateKey) {
+    return {
+      projectId: (process.env.FIREBASE_PROJECT_ID || FIREBASE_PROJECT_ID).trim(),
+      clientEmail,
+      privateKey: privateKey.replace(/\\n/g, '\n'),
+    };
+  }
+
+  return null;
+}
+
+const serviceAccount = resolveFirebaseServiceAccount();
+const hasAdminCredentials = Boolean(serviceAccount);
+
+const adminApp =
+  getApps().length > 0
+    ? getApps()[0]
+    : serviceAccount
+    ? initializeApp({
+        credential: cert(serviceAccount),
+        projectId: serviceAccount.projectId || FIREBASE_PROJECT_ID,
+      })
+    : initializeApp({ projectId: FIREBASE_PROJECT_ID });
 
 let firestoreDb: any = null;
 try {
@@ -434,122 +457,81 @@ const INITIAL_EXPENSES_SEED = [
 ];
 
 // ------------------------------------------------------------------------------
-// PERMANENT DISK PERSISTENCE ENGINE (data/*.json)
-// Safeguards orders, expenses, and settlements against serverless & process restarts
+// TRANSIENT IN-MEMORY CACHE + CLOUD FIRESTORE SINGLE SOURCE OF TRUTH
+// Never stores permanent runtime data on local/ephemeral repo data/*.json disk
 // ------------------------------------------------------------------------------
-const DATA_DIR = isServerless
-  ? path.join('/tmp', 'cooknow-data')
-  : path.resolve(process.cwd(), 'data');
-
-try {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-} catch {
-  // Ignored in read-only serverless environment
-}
-
-const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
-const EXPENSES_FILE = path.join(DATA_DIR, 'expenses.json');
-const SETTLEMENTS_FILE = path.join(DATA_DIR, 'settlements.json');
-
 function persistOrders() {
-  try {
-    const list = Array.from(LIVE_ORDERS_CACHE.values());
-    fs.writeFileSync(ORDERS_FILE, JSON.stringify(list, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Error persisting orders to disk:', err);
-  }
+  // In-memory map updated; Cloud Firestore is the permanent source of truth
 }
 
 function persistExpenses() {
-  try {
-    const list = Array.from(LIVE_EXPENSES_CACHE.values());
-    fs.writeFileSync(EXPENSES_FILE, JSON.stringify(list, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Error persisting expenses to disk:', err);
-  }
+  // In-memory map updated; Cloud Firestore is the permanent source of truth
 }
 
 function persistSettlements() {
-  try {
-    const list = Array.from(LIVE_SETTLEMENTS_CACHE.values());
-    fs.writeFileSync(SETTLEMENTS_FILE, JSON.stringify(list, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Error persisting settlements to disk:', err);
-  }
+  // In-memory map updated; Cloud Firestore is the permanent source of truth
 }
 
-// 1. Initialize Orders: Load from persistent disk file or seed baseline
-try {
-  const repoOrdersFile = path.resolve(process.cwd(), 'data', 'orders.json');
-if (fs.existsSync(ORDERS_FILE) || fs.existsSync(repoOrdersFile)) {
-    const targetFile = fs.existsSync(ORDERS_FILE) ? ORDERS_FILE : repoOrdersFile;
-    const loaded = JSON.parse(fs.readFileSync(targetFile, 'utf8'));
-    if (Array.isArray(loaded) && loaded.length > 0) {
-      for (const ord of loaded) {
-        LIVE_ORDERS_CACHE.set(ord.id, ord);
-      }
-    } else {
-      for (const ord of INITIAL_ORDERS_SEED) {
-        LIVE_ORDERS_CACHE.set(ord.id, ord);
-      }
-      persistOrders();
-    }
-  } else {
-    for (const ord of INITIAL_ORDERS_SEED) {
-      LIVE_ORDERS_CACHE.set(ord.id, ord);
-    }
-    persistOrders();
-  }
-} catch (e) {
-  for (const ord of INITIAL_ORDERS_SEED) {
-    LIVE_ORDERS_CACHE.set(ord.id, ord);
-  }
+// Hydrate transient baseline cache when Firestore Admin credentials are absent
+for (const ord of INITIAL_ORDERS_SEED) {
+  LIVE_ORDERS_CACHE.set(ord.id, ord);
+}
+for (const exp of INITIAL_EXPENSES_SEED) {
+  LIVE_EXPENSES_CACHE.set(exp.id, exp);
 }
 
-// 2. Initialize Expenses: Load from persistent disk file or seed baseline
-try {
-  const repoExpensesFile = path.resolve(process.cwd(), 'data', 'expenses.json');
-if (fs.existsSync(EXPENSES_FILE) || fs.existsSync(repoExpensesFile)) {
-    const targetFile = fs.existsSync(EXPENSES_FILE) ? EXPENSES_FILE : repoExpensesFile;
-    const loaded = JSON.parse(fs.readFileSync(targetFile, 'utf8'));
-    if (Array.isArray(loaded) && loaded.length > 0) {
-      for (const exp of loaded) {
-        LIVE_EXPENSES_CACHE.set(exp.id, exp);
+async function fetchOrdersFromFirestoreOrCache(): Promise<any[]> {
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      const snap = await firestoreDb.collection('orders').get();
+      if (!snap.empty) {
+        const list = snap.docs.map((d: any) => ({ id: d.id, ...d.data() }));
+        for (const o of list) {
+          LIVE_ORDERS_CACHE.set(o.id, o);
+        }
+        return list;
       }
-    } else {
-      for (const exp of INITIAL_EXPENSES_SEED) {
-        LIVE_EXPENSES_CACHE.set(exp.id, exp);
-      }
-      persistExpenses();
+    } catch {
+      // Fallback to in-memory cache
     }
-  } else {
-    for (const exp of INITIAL_EXPENSES_SEED) {
-      LIVE_EXPENSES_CACHE.set(exp.id, exp);
-    }
-    persistExpenses();
   }
-} catch (e) {
-  for (const exp of INITIAL_EXPENSES_SEED) {
-    LIVE_EXPENSES_CACHE.set(exp.id, exp);
-  }
+  return Array.from(LIVE_ORDERS_CACHE.values());
 }
 
-// 3. Initialize Settlements: Load from persistent disk file
-try {
-  if (fs.existsSync(SETTLEMENTS_FILE)) {
-    const loaded = JSON.parse(fs.readFileSync(SETTLEMENTS_FILE, 'utf8'));
-    if (Array.isArray(loaded)) {
-      for (const set of loaded) {
-        LIVE_SETTLEMENTS_CACHE.set(set.id, set);
+async function fetchExpensesFromFirestoreOrCache(): Promise<any[]> {
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      const snap = await firestoreDb.collection('operating_expenses').get();
+      if (!snap.empty) {
+        const list = snap.docs.map((d: any) => ({ id: d.id, ...d.data() }));
+        for (const e of list) {
+          LIVE_EXPENSES_CACHE.set(e.id, e);
+        }
+        return list;
       }
+    } catch {
+      // Fallback to in-memory cache
     }
-  } else {
-    persistSettlements();
   }
-} catch (e) {
-  // Non-fatal
+  return Array.from(LIVE_EXPENSES_CACHE.values());
+}
+
+async function fetchSettlementsFromFirestoreOrCache(): Promise<any[]> {
+  if (hasAdminCredentials && firestoreDb) {
+    try {
+      const snap = await firestoreDb.collection('settlements').get();
+      if (!snap.empty) {
+        const list = snap.docs.map((d: any) => ({ id: d.id, ...d.data() }));
+        for (const s of list) {
+          LIVE_SETTLEMENTS_CACHE.set(s.id, s);
+        }
+        return list;
+      }
+    } catch {
+      // Fallback to in-memory cache
+    }
+  }
+  return Array.from(LIVE_SETTLEMENTS_CACHE.values());
 }
 
 // ------------------------------------------------------------------------------
@@ -697,8 +679,33 @@ router.post('/orders/place', async (req: Request, res: Response) => {
     )
     .digest('hex');
 
-  // 2.7 Idempotency check against store
-  const existingIdempotency = IDEMPOTENCY_STORE.get(cleanIdempotencyKey);
+  // 2.7 Idempotency check against Firestore (when Admin SDK active) + memory store
+  let existingIdempotency = IDEMPOTENCY_STORE.get(cleanIdempotencyKey);
+  if (!existingIdempotency && hasAdminCredentials && firestoreDb) {
+    try {
+      const idemSnap = await firestoreDb
+        .collection('order_idempotency')
+        .doc(cleanIdempotencyKey)
+        .get();
+      if (idemSnap.exists) {
+        const idemData = idemSnap.data();
+        if (idemData?.orderId) {
+          const ordSnap = await firestoreDb.collection('orders').doc(idemData.orderId).get();
+          if (ordSnap.exists) {
+            existingIdempotency = {
+              customerId: idemData.customerId,
+              payloadSignature: idemData.payloadSignature,
+              order: { id: ordSnap.id, ...ordSnap.data() },
+              createdAt: Date.now(),
+            };
+          }
+        }
+      }
+    } catch {
+      // Non-fatal fallback
+    }
+  }
+
   if (existingIdempotency) {
     if (existingIdempotency.customerId !== customerUid) {
       return res.status(403).json({
@@ -924,12 +931,8 @@ router.get('/orders/my-orders', async (req: Request, res: Response) => {
     return res.status(401).json({ success: false, error: 'Authentication required.' });
   }
 
-  const customerOrders: any[] = [];
-  for (const order of LIVE_ORDERS_CACHE.values()) {
-    if (order.customerId === verifiedUser.uid) {
-      customerOrders.push(order);
-    }
-  }
+  const allOrders = await fetchOrdersFromFirestoreOrCache();
+  const customerOrders = allOrders.filter((order) => order.customerId === verifiedUser.uid);
 
   customerOrders.sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
@@ -946,13 +949,8 @@ router.get('/orders/kitchen-orders', async (req: Request, res: Response) => {
   }
 
   const cookId = (req.query.cookId as string) || '';
-  const kitchenOrders: any[] = [];
-
-  for (const order of LIVE_ORDERS_CACHE.values()) {
-    if (!cookId || order.cookId === cookId) {
-      kitchenOrders.push(order);
-    }
-  }
+  const allOrders = await fetchOrdersFromFirestoreOrCache();
+  const kitchenOrders = allOrders.filter((order) => !cookId || order.cookId === cookId);
 
   return res.json({ success: true, orders: kitchenOrders });
 });
@@ -965,16 +963,10 @@ router.get('/orders/rider-orders', async (req: Request, res: Response) => {
   }
 
   const riderId = (req.query.riderId as string) || '';
-  const riderOrders: any[] = [];
-
-  for (const order of LIVE_ORDERS_CACHE.values()) {
-    if (
-      (!riderId && order.status === 'ready') ||
-      order.deliveryPartnerId === riderId
-    ) {
-      riderOrders.push(order);
-    }
-  }
+  const allOrders = await fetchOrdersFromFirestoreOrCache();
+  const riderOrders = allOrders.filter(
+    (order) => (!riderId && order.status === 'ready') || order.deliveryPartnerId === riderId
+  );
 
   return res.json({ success: true, orders: riderOrders });
 });
@@ -993,7 +985,7 @@ router.get('/orders/admin-all', async (req: Request, res: Response) => {
     });
   }
 
-  const allOrders = Array.from(LIVE_ORDERS_CACHE.values());
+  const allOrders = await fetchOrdersFromFirestoreOrCache();
   allOrders.sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
   );
@@ -1157,8 +1149,8 @@ router.get('/owner/analytics', async (req: Request, res: Response) => {
   if (!verifiedOwner) return;
 
   const timeRange = ((req.query.timeRange as string) || '30d').toLowerCase();
-  const allOrders = Array.from(LIVE_ORDERS_CACHE.values());
-  const allExpenses = Array.from(LIVE_EXPENSES_CACHE.values());
+  const allOrders = await fetchOrdersFromFirestoreOrCache();
+  const allExpenses = await fetchExpensesFromFirestoreOrCache();
 
   const now = new Date();
   const nowMs = now.getTime();
@@ -1445,7 +1437,7 @@ router.get('/owner/expenses', async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
-  const expenses = Array.from(LIVE_EXPENSES_CACHE.values());
+  const expenses = await fetchExpensesFromFirestoreOrCache();
   expenses.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   return res.json({ success: true, expenses });
 });
@@ -1589,8 +1581,9 @@ router.get('/owner/settlements', async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
-  const orders = Array.from(LIVE_ORDERS_CACHE.values()).filter((o) => o.status === 'delivered');
-  const settlementHistory = Array.from(LIVE_SETTLEMENTS_CACHE.values());
+  const allOrders = await fetchOrdersFromFirestoreOrCache();
+  const orders = allOrders.filter((o) => o.status === 'delivered');
+  const settlementHistory = await fetchSettlementsFromFirestoreOrCache();
 
   // Aggregate payouts by cook
   const cookMap = new Map<string, { cookId: string; kitchenName: string; totalEarnings: number; ordersCount: number }>();
@@ -1669,7 +1662,7 @@ router.get('/owner/export-csv', async (req: Request, res: Response) => {
   const verifiedOwner = await requireVerifiedOwner(req, res);
   if (!verifiedOwner) return;
 
-  const orders = Array.from(LIVE_ORDERS_CACHE.values());
+  const orders = await fetchOrdersFromFirestoreOrCache();
   orders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
   const headers = [
@@ -1733,19 +1726,8 @@ router.get('/owner/export-csv', async (req: Request, res: Response) => {
 
 // 12. Public Client Configuration Endpoint
 router.get('/config/public-client', (_req: Request, res: Response) => {
-  let supabaseUrl = (process.env.VITE_SUPABASE_URL || '').trim();
-  let supabaseAnonKey = (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
-
-  try {
-    const configPath = path.resolve(process.cwd(), 'supabase.config.json');
-    if (fs.existsSync(configPath)) {
-      const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-      if (parsed.url && parsed.url.startsWith('http')) supabaseUrl = parsed.url;
-      if (parsed.anonKey && parsed.anonKey.length > 20) supabaseAnonKey = parsed.anonKey;
-    }
-  } catch {
-    // Non-fatal
-  }
+  const supabaseUrl = (process.env.VITE_SUPABASE_URL || '').trim();
+  const supabaseAnonKey = (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
 
   const isPublishableKeyInUrl = supabaseUrl.startsWith('sb_') || supabaseUrl.startsWith('eyJ');
   const isHttpUrl = supabaseUrl.startsWith('http://') || supabaseUrl.startsWith('https://');
@@ -1902,13 +1884,6 @@ router.post('/config/supabase', async (req: Request, res: Response) => {
   process.env.VITE_SUPABASE_URL = url;
   process.env.VITE_SUPABASE_ANON_KEY = anonKey;
 
-  try {
-    const configPath = path.resolve(process.cwd(), 'supabase.config.json');
-    fs.writeFileSync(configPath, JSON.stringify({ url, anonKey }, null, 2), 'utf8');
-  } catch {
-    // Non-fatal
-  }
-
   const diag = await diagnoseSupabaseConnection(url, anonKey);
   return res.json({ success: true, saved: true, url, anonKey, ...diag });
 });
@@ -1926,6 +1901,7 @@ app.get('/api', (_req: Request, res: Response) => {
     hub: 'Nalapani Chowk, Dehradun, Uttarakhand',
     version: '1.0.0',
     primaryDatabase: 'Cloud Firestore (cooknow-9444c)',
+    adminCredentialsConfigured: hasAdminCredentials,
     timestamp: new Date().toISOString(),
   });
 });
@@ -1933,5 +1909,5 @@ app.get('/api', (_req: Request, res: Response) => {
 app.use('/api', router);
 app.use('/', router);
 
-export { app, router };
+export { app, router, hasAdminCredentials };
 export default app;

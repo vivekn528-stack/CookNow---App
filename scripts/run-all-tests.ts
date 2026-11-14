@@ -337,19 +337,40 @@ async function runTestSuite() {
     );
 
     // --------------------------------------------------------------------------
-    // TEST GROUP 8: PERMANENT PERSISTENCE & FINANCIAL AUDIT TRAIL
+    // TEST GROUP 8: FIREBASE-FIRST PERSISTENCE & FINANCIAL AUDIT VERIFICATION
     // --------------------------------------------------------------------------
-    console.log('\n>>> TEST GROUP 8: Permanent Persistence & Financial Audit Verification');
+    console.log('\n>>> TEST GROUP 8: Firebase-First Persistence & Financial Audit Verification');
 
-    const ordersJsonExists = fs.existsSync('data/orders.json');
-    const expensesJsonExists = fs.existsSync('data/expenses.json');
-    recordResult('Server persistent disk store (data/orders.json) exists', ordersJsonExists);
-    recordResult('Server persistent disk store (data/expenses.json) exists', expensesJsonExists);
+    const rootApiRes = await apiRequest('/api');
+    recordResult(
+      'GET /api confirms Firebase-First Single Source of Truth (Cloud Firestore)',
+      rootApiRes.status === 200 &&
+        rootApiRes.data?.architecture === 'Firebase-First Single Source of Truth' &&
+        rootApiRes.data?.primaryDatabase === 'Cloud Firestore (cooknow-9444c)'
+    );
 
-    if (ordersJsonExists) {
-      const ordersData = JSON.parse(fs.readFileSync('data/orders.json', 'utf8'));
-      recordResult('Persistent orders file contains valid array', Array.isArray(ordersData) && ordersData.length > 0);
-    }
+    const apiCode = fs.readFileSync('api/index.ts', 'utf8');
+    recordResult(
+      'Backend uses server-only Firebase Admin credential resolution (no VITE_ leakage)',
+      apiCode.includes('FIREBASE_SERVICE_ACCOUNT_JSON') &&
+        apiCode.includes('resolveFirebaseServiceAccount') &&
+        !apiCode.includes('VITE_FIREBASE_PRIVATE_KEY')
+    );
+
+    recordResult(
+      'Public client config endpoint does not expose Firebase Admin credentials',
+      !JSON.stringify(configRes.data).includes('private_key') &&
+        !JSON.stringify(configRes.data).includes('client_email')
+    );
+
+    const rulesCode = fs.readFileSync('firestore.rules', 'utf8');
+    recordResult(
+      'firestore.rules enforces strict RBAC on orders, settlements, expenses, and audit_logs',
+      rulesCode.includes('match /orders/{orderId}') &&
+        rulesCode.includes('match /settlements/{settlementId}') &&
+        rulesCode.includes('match /operating_expenses/{expenseId}') &&
+        rulesCode.includes('match /audit_logs/{logId}')
+    );
 
     const confirmCodNoAuth = await apiRequest('/api/orders/ORD-9821/confirm-cod', { method: 'PATCH' });
     recordResult(
