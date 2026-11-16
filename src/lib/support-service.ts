@@ -127,15 +127,44 @@ function logFirestorePermissionContext(
   }));
 }
 
-async function getAuthenticatedToken(): Promise<{ uid: string; token: string }> {
+function stripUndefinedDeep<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripUndefinedDeep(item)) as unknown as T;
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (v !== undefined) {
+        out[k] = stripUndefinedDeep(v);
+      }
+    }
+    return out as T;
+  }
+  return value;
+}
+
+function isNotFoundOrColdStartError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+  return msg.includes('not found') || msg.includes('404');
+}
+
+async function getAuthenticatedToken(): Promise<{ uid: string; email: string | null; emailVerified: boolean; token: string }> {
   await ensureFirebaseInitialized();
   const auth = getFirebaseAuth();
+  if (auth && typeof (auth as any).authStateReady === 'function') {
+    await (auth as any).authStateReady();
+  }
   const currentUser = auth?.currentUser;
   if (!currentUser) {
     throw new Error('Authentication required. Please sign in with Google first.');
   }
   const token = await currentUser.getIdToken();
-  return { uid: currentUser.uid, token };
+  return {
+    uid: currentUser.uid,
+    email: currentUser.email || null,
+    emailVerified: Boolean(currentUser.emailVerified),
+    token,
+  };
 }
 
 async function getClientDb(): Promise<Firestore | null> {
@@ -364,7 +393,7 @@ export const supportService = {
     stats: SupportTicketStats;
     adminPersisted: boolean;
   }> {
-    const { token } = await getAuthenticatedToken();
+    const { email, emailVerified, token } = await getAuthenticatedToken();
     const qs = new URLSearchParams();
     if (filters?.search) qs.set('search', filters.search);
     if (filters?.status && filters.status !== 'all') qs.set('status', filters.status);
@@ -375,26 +404,41 @@ export const supportService = {
     if (filters?.unreadOnly) qs.set('unreadOnly', 'true');
 
     const queryStr = qs.toString();
-    const data = await apiJson(
-      `/api/support/tickets${queryStr ? `?${queryStr}` : ''}`,
-      token
-    );
+    let serverTickets: SupportTicket[] = [];
+    let serverStats: SupportTicketStats | null = null;
+    let adminPersisted = false;
+    let apiError: unknown = null;
 
-    const serverTickets = (data.tickets || []) as SupportTicket[];
-    const adminPersisted = Boolean(data.adminPersisted);
+    try {
+      const data = await apiJson(
+        `/api/support/tickets${queryStr ? `?${queryStr}` : ''}`,
+        token
+      );
+      serverTickets = (data.tickets || []) as SupportTicket[];
+      serverStats = (data.stats as SupportTicketStats) || null;
+      adminPersisted = Boolean(data.adminPersisted);
+    } catch (err) {
+      apiError = err;
+    }
 
     if (!adminPersisted) {
+      const isVerifiedOwner =
+        email?.toLowerCase().trim() === 'vivekn528@gmail.com' && emailVerified === true;
       const db = await getClientDb();
-      if (db) {
+      if (db && (isVerifiedOwner || !apiError)) {
         try {
           const snap = await getDocs(collection(db, 'support_tickets'));
           const fsTickets = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as SupportTicket[];
-          // Also fetch unfiltered server list when merging in local dev mode
-          const unfilteredRes =
-            queryStr.length > 0
-              ? ((await apiJson('/api/support/tickets', token)).tickets as SupportTicket[])
-              : serverTickets;
-          const allTickets = mergeTicketsNewestWins(fsTickets, unfilteredRes);
+          let unfilteredServer = serverTickets;
+          if (!apiError && queryStr.length > 0) {
+            try {
+              const rawAll = await apiJson('/api/support/tickets', token);
+              unfilteredServer = (rawAll.tickets || []) as SupportTicket[];
+            } catch {
+              unfilteredServer = serverTickets;
+            }
+          }
+          const allTickets = mergeTicketsNewestWins(fsTickets, unfilteredServer);
           return {
             tickets: applyTicketFilters(allTickets, filters),
             allTickets,
@@ -410,12 +454,15 @@ export const supportService = {
           );
         }
       }
+      if (apiError) {
+        throw apiError;
+      }
     }
 
     return {
       tickets: serverTickets,
       allTickets: serverTickets,
-      stats: data.stats as SupportTicketStats,
+      stats: serverStats || computeSupportStatsLocal(serverTickets),
       adminPersisted,
     };
   },
@@ -609,7 +656,7 @@ export const supportService = {
     } catch (err: any) {
       // Fallback if ticket lives in Firestore (e.g. across server restarts without Admin creds)
       const db = await getClientDb();
-      if (db && err?.message?.includes('not found') && options?.existingTicket) {
+      if (db && isNotFoundOrColdStartError(err) && options?.existingTicket) {
         const nowIso = new Date().toISOString();
         const isOwner = options.senderRole === 'owner';
         const senderName =
@@ -710,7 +757,7 @@ export const supportService = {
       return { note: data.note, ticket: data.ticket };
     } catch (err: any) {
       const db = await getClientDb();
-      if (db && err?.message?.includes('not found') && existingTicket) {
+      if (db && isNotFoundOrColdStartError(err) && existingTicket) {
         const auth = getFirebaseAuth();
         const nowIso = new Date().toISOString();
         const note: SupportInternalNote = {
@@ -766,7 +813,7 @@ export const supportService = {
       return updated;
     } catch (err: any) {
       const db = await getClientDb();
-      if (db && err?.message?.includes('not found') && existingTicket) {
+      if (db && isNotFoundOrColdStartError(err) && existingTicket) {
         const nowIso = new Date().toISOString();
         const next: SupportTicket = { ...existingTicket, updatedAt: nowIso };
         const addedEvents: SupportHistoryEvent[] = [];
@@ -877,7 +924,7 @@ export const supportService = {
       return updated;
     } catch (err: any) {
       const db = await getClientDb();
-      if (db && err?.message?.includes('not found') && existingTicket) {
+      if (db && isNotFoundOrColdStartError(err) && existingTicket) {
         if (payload.status === 'Processed') {
           if (existingTicket.refund?.status === 'Rejected') {
             throw new Error('Cannot mark a rejected refund as Processed.');
@@ -887,22 +934,27 @@ export const supportService = {
           }
         }
         const nowIso = new Date().toISOString();
-        const next: SupportTicket = {
+        const nextRefund: SupportTicket['refund'] = {
+          status: payload.status,
+          amount: payload.status === 'Rejected' ? 0 : Math.round(Number(payload.amount || 0)),
+          reason: payload.reason.trim(),
+          requestedAt: existingTicket.refund?.requestedAt || nowIso,
+          decidedAt: nowIso,
+          responsibleAdmin: 'Vivek Singh Negi (vivekn528@gmail.com)',
+          manualConfirmationChecked:
+            payload.status === 'Processed' ? Boolean(payload.manualConfirmationChecked) : false,
+        };
+        if (payload.status === 'Processed') {
+          nextRefund.processedAt = nowIso;
+        }
+        if (payload.settlementReference?.trim()) {
+          nextRefund.settlementReference = payload.settlementReference.trim();
+        }
+        const next: SupportTicket = stripUndefinedDeep({
           ...existingTicket,
           updatedAt: nowIso,
           unreadForCustomer: true,
-          refund: {
-            status: payload.status,
-            amount: payload.status === 'Rejected' ? 0 : Math.round(Number(payload.amount || 0)),
-            reason: payload.reason.trim(),
-            requestedAt: existingTicket.refund?.requestedAt || nowIso,
-            decidedAt: nowIso,
-            processedAt: payload.status === 'Processed' ? nowIso : undefined,
-            responsibleAdmin: 'Vivek Singh Negi (vivekn528@gmail.com)',
-            settlementReference: payload.settlementReference?.trim() || undefined,
-            manualConfirmationChecked:
-              payload.status === 'Processed' ? Boolean(payload.manualConfirmationChecked) : false,
-          },
+          refund: nextRefund,
           history: [
             ...(existingTicket.history || []),
             {
@@ -914,7 +966,7 @@ export const supportService = {
               details: `Refund set to ${payload.status} (₹${payload.status === 'Rejected' ? 0 : Math.round(Number(payload.amount || 0))}) · Reason: ${payload.reason.trim()}`,
             },
           ],
-        };
+        });
         try {
           await setDoc(doc(db, 'support_tickets', ticketId), next, { merge: true });
           await setDoc(doc(db, 'audit_logs', `aud_ref_${ticketId}_${Date.now()}`), {
@@ -973,7 +1025,7 @@ export const supportService = {
       return updated;
     } catch (err: any) {
       const db = await getClientDb();
-      if (db && err?.message?.includes('not found') && existingTicket) {
+      if (db && isNotFoundOrColdStartError(err) && existingTicket) {
         const nowIso = new Date().toISOString();
         const nextHistory: SupportHistoryEvent[] = [
           ...(existingTicket.history || []),

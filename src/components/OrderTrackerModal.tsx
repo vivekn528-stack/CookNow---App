@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { X, CheckCircle, Clock, MapPin, ChefHat, AlertTriangle, Phone, Receipt } from 'lucide-react';
 import { Order, OrderStatus } from '../types';
 import { getMenuItemImage, getMenuItemAlt, FALLBACK_MEAL_IMAGE } from '../lib/image-registry';
+import { getLatestOrderStatus } from '../lib/order-status';
 
 interface OrderTrackerModalProps {
   order: Order | null;
@@ -29,9 +30,10 @@ export const OrderTrackerModal: React.FC<OrderTrackerModalProps> = ({
 
   if (!order) return null;
 
-  const currentStepIndex = LIFECYCLE_STEPS.findIndex((s) => s.status === order.status);
-  const isCancelled = order.status === 'cancelled';
-  const canCancel = order.status === 'pending' || order.status === 'accepted';
+  const currentStatus = getLatestOrderStatus(order);
+  const currentStepIndex = LIFECYCLE_STEPS.findIndex((s) => s.status === currentStatus);
+  const isCancelled = currentStatus === 'cancelled';
+  const canCancel = currentStatus === 'pending' || currentStatus === 'accepted';
 
   const handleCancelSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -57,12 +59,12 @@ export const OrderTrackerModal: React.FC<OrderTrackerModalProps> = ({
                 className={`text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 rounded ${
                   isCancelled
                     ? 'bg-rose-100 text-rose-800'
-                    : order.status === 'delivered'
+                    : currentStatus === 'delivered'
                     ? 'bg-emerald-100 text-emerald-800'
                     : 'bg-amber-100 text-amber-800'
                 }`}
               >
-                {order.status.replace(/_/g, ' ')}
+                {currentStatus.replace(/_/g, ' ')}
               </span>
             </div>
             <p className="text-xs text-stone-500">

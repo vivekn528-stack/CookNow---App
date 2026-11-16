@@ -13,6 +13,7 @@ import {
   Star,
 } from 'lucide-react';
 import { DeliveryPartner, Order, OrderStatus } from '../types';
+import { getLatestOrderStatus } from '../lib/order-status';
 
 interface DeliveryPartnerDashboardProps {
   deliveryPartners: DeliveryPartner[];
@@ -34,19 +35,19 @@ export const DeliveryPartnerDashboard: React.FC<DeliveryPartnerDashboardProps> =
   // Filter orders
   // Available: Ready orders that have no delivery partner assigned yet
   const availableOrders = orders.filter(
-    (o) => o.status === 'ready' && (!o.deliveryPartnerId || o.deliveryStatus === 'unassigned')
+    (o) => getLatestOrderStatus(o) === 'ready' && (!o.deliveryPartnerId || o.deliveryStatus === 'unassigned')
   );
 
   // Assigned to current delivery partner
   const myActiveOrders = orders.filter(
     (o) =>
       o.deliveryPartnerId === currentPartner.id &&
-      ['ready', 'out_for_delivery'].includes(o.status)
+      ['ready', 'out_for_delivery'].includes(getLatestOrderStatus(o))
   );
 
   // Completed by current partner
   const myCompletedOrders = orders.filter(
-    (o) => o.deliveryPartnerId === currentPartner.id && o.status === 'delivered'
+    (o) => o.deliveryPartnerId === currentPartner.id && getLatestOrderStatus(o) === 'delivered'
   );
 
   const earningsTotal = myCompletedOrders.length * 25; // ₹25 per completed delivery

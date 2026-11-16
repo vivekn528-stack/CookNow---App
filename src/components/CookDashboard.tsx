@@ -25,6 +25,7 @@ import { Cook, MenuItem, Order, OrderStatus, DietaryType, CookVerificationReques
 import { StorageManager } from '../lib/storage';
 import { storageService, validateImageFile, validateDocumentFile } from '../lib/storage-service';
 import { getMenuItemImage, getMenuItemAlt, FALLBACK_MEAL_IMAGE } from '../lib/image-registry';
+import { getLatestOrderStatus } from '../lib/order-status';
 
 interface CookDashboardProps {
   cooks: Cook[];
@@ -76,16 +77,16 @@ export const CookDashboard: React.FC<CookDashboardProps> = ({
   const cookOrders = orders.filter((o) => o.cookId === currentCook.id);
 
   // Financial calculations
-  const deliveredOrders = cookOrders.filter((o) => o.status === 'delivered');
+  const deliveredOrders = cookOrders.filter((o) => getLatestOrderStatus(o) === 'delivered');
   const grossSales = deliveredOrders.reduce((sum, o) => sum + o.itemsSubtotal, 0);
   const platformCommissionRate = 15;
   const platformCommissionDeducted = Math.round((grossSales * platformCommissionRate) / 100);
   const netCookEarnings = grossSales - platformCommissionDeducted;
 
   // Active incoming orders
-  const pendingOrders = cookOrders.filter((o) => o.status === 'pending');
+  const pendingOrders = cookOrders.filter((o) => getLatestOrderStatus(o) === 'pending');
   const activeOrders = cookOrders.filter(
-    (o) => !['delivered', 'cancelled', 'pending'].includes(o.status)
+    (o) => !['delivered', 'cancelled', 'pending'].includes(getLatestOrderStatus(o))
   );
 
   const handleSaveItemSubmit = (e: React.FormEvent) => {
@@ -376,6 +377,7 @@ export const CookDashboard: React.FC<CookDashboardProps> = ({
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {activeOrders.map((order) => {
+                  const orderStatus = getLatestOrderStatus(order);
                   return (
                     <div
                       key={order.id}
@@ -388,7 +390,7 @@ export const CookDashboard: React.FC<CookDashboardProps> = ({
                               Order #{order.id}
                             </span>
                             <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                              {order.status.replace(/_/g, ' ')}
+                              {orderStatus.replace(/_/g, ' ')}
                             </span>
                           </div>
                           <div className="text-xs text-stone-500 mt-1">
@@ -420,7 +422,7 @@ export const CookDashboard: React.FC<CookDashboardProps> = ({
                         </span>
 
                         <div className="flex flex-wrap items-center gap-2">
-                          {order.status === 'accepted' && (
+                          {orderStatus === 'accepted' && (
                             <button
                               onClick={() => onUpdateOrderStatus(order.id, 'preparing')}
                               className="px-3.5 py-1.5 bg-emerald-800 hover:bg-emerald-900 text-white font-bold text-xs rounded-lg transition-colors cursor-pointer"
@@ -428,7 +430,7 @@ export const CookDashboard: React.FC<CookDashboardProps> = ({
                               Mark as Cooking (Preparing)
                             </button>
                           )}
-                          {order.status === 'preparing' && (
+                          {orderStatus === 'preparing' && (
                             <button
                               onClick={() => onUpdateOrderStatus(order.id, 'ready')}
                               className="px-3.5 py-1.5 bg-emerald-800 hover:bg-emerald-900 text-white font-bold text-xs rounded-lg transition-colors cursor-pointer"
@@ -436,7 +438,7 @@ export const CookDashboard: React.FC<CookDashboardProps> = ({
                               Mark Ready & Packed
                             </button>
                           )}
-                          {order.status === 'ready' && (
+                          {orderStatus === 'ready' && (
                             <button
                               onClick={() => onUpdateOrderStatus(order.id, 'out_for_delivery')}
                               className="px-3.5 py-1.5 bg-emerald-800 hover:bg-emerald-900 text-white font-bold text-xs rounded-lg transition-colors cursor-pointer"
@@ -444,7 +446,7 @@ export const CookDashboard: React.FC<CookDashboardProps> = ({
                               Dispatch with Delivery Partner
                             </button>
                           )}
-                          {order.status === 'out_for_delivery' && (
+                          {orderStatus === 'out_for_delivery' && (
                             <button
                               onClick={() => onUpdateOrderStatus(order.id, 'delivered')}
                               className="px-3.5 py-1.5 bg-emerald-800 hover:bg-emerald-900 text-white font-bold text-xs rounded-lg transition-colors cursor-pointer"

@@ -6,6 +6,12 @@ import http from 'node:http';
 import fs from 'node:fs';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import app from '../server';
+import {
+  buildActivityStreamEvents,
+  computeActiveOrders,
+  getLatestOrderStatus,
+  normalizeOrderDocument,
+} from '../src/lib/order-status';
 
 const TEST_PORT = 3999;
 let server: http.Server;
@@ -912,6 +918,161 @@ async function runTestSuite() {
         finalStats?.avgSatisfactionRating === 5 &&
         finalStats?.satisfactionResponseCount === 1 &&
         typeof finalStats?.avgResolutionMinutes === 'number'
+    );
+
+    // --------------------------------------------------------------------------
+    // TEST GROUP 9: OWNER DASHBOARD ORDER STATUS SYNCHRONIZATION & ACTIVE ORDERS REGRESSION
+    // --------------------------------------------------------------------------
+    console.log('\n>>> TEST GROUP 9: Owner Dashboard Order Status Sync & Active Orders Regression');
+
+    const baselineAnalyticsRes = await apiRequest('/api/owner/analytics?timeRange=30d', {
+      token: ownerToken,
+    });
+    const baselineActiveCount = baselineAnalyticsRes.data?.metrics?.activeOrdersCount ?? 0;
+
+    // 9a. Place fresh COD order (starts in pending)
+    const syncRegOrderRes = await apiRequest('/api/orders/place', {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        cookId: 'cook-1',
+        items: [{ menuItemId: 'menu-student-full', quantity: 1 }],
+        paymentMethod: 'cod',
+        idempotencyKey: `idem_sync_reg_${Date.now()}`,
+        deliveryAddress: {
+          fullName: 'Aarav Rawat',
+          phone: '9876543210',
+          locality: 'Nalapani Chowk',
+          addressLine: 'Room 21, Shivalik PG',
+        },
+      },
+    });
+    const regOrderId = syncRegOrderRes.data?.order?.id;
+
+    // 9b. Cook accepts and moves order to PREPARING
+    const regAcceptRes = await apiRequest(`/api/orders/${regOrderId}/status`, {
+      method: 'PATCH',
+      token: cookToken,
+      body: { status: 'accepted' },
+    });
+    await new Promise((r) => setTimeout(r, 15));
+    const regPrepareRes = await apiRequest(`/api/orders/${regOrderId}/status`, {
+      method: 'PATCH',
+      token: cookToken,
+      body: { status: 'preparing' },
+    });
+
+    const [
+      adminOrdersAfterPrepRes,
+      kitchenOrdersAfterPrepRes,
+      customerOrdersAfterPrepRes,
+      analyticsAfterPrepRes,
+    ] = await Promise.all([
+      apiRequest('/api/orders/admin-all', { token: ownerToken }),
+      apiRequest('/api/orders/kitchen-orders', { token: cookToken }),
+      apiRequest('/api/orders/my-orders', { token: customerToken }),
+      apiRequest('/api/owner/analytics?timeRange=30d', { token: ownerToken }),
+    ]);
+
+    const ownerOrderView = adminOrdersAfterPrepRes.data?.orders?.find((o: any) => o.id === regOrderId);
+    const kitchenOrderView = kitchenOrdersAfterPrepRes.data?.orders?.find((o: any) => o.id === regOrderId);
+    const customerOrderView = customerOrdersAfterPrepRes.data?.orders?.find((o: any) => o.id === regOrderId);
+    const activeCountAfterPrep = analyticsAfterPrepRes.data?.metrics?.activeOrdersCount ?? 0;
+
+    recordResult(
+      'Accepting order and moving to PREPARING updates Owner, Kitchen & Customer status + increments Active Orders',
+      syncRegOrderRes.status === 200 &&
+        regAcceptRes.status === 200 &&
+        regPrepareRes.status === 200 &&
+        ownerOrderView?.status === 'preparing' &&
+        kitchenOrderView?.status === 'preparing' &&
+        customerOrderView?.status === 'preparing' &&
+        activeCountAfterPrep === baselineActiveCount + 1 &&
+        ownerOrderView?.events?.map((e: any) => e.status).join(',') === 'pending,accepted,preparing',
+      `place=${syncRegOrderRes.status} owner=${ownerOrderView?.status} active=${activeCountAfterPrep}/${baselineActiveCount + 1}`
+    );
+
+    // 9c. Advance order to READY and OUT_FOR_DELIVERY & verify rider + owner sync + active count
+    await new Promise((r) => setTimeout(r, 15));
+    const regReadyRes = await apiRequest(`/api/orders/${regOrderId}/status`, {
+      method: 'PATCH',
+      token: cookToken,
+      body: { status: 'ready' },
+    });
+    const riderReadyListRes = await apiRequest('/api/orders/rider-orders', { token: riderToken });
+    const analyticsAfterReadyRes = await apiRequest('/api/owner/analytics?timeRange=30d', {
+      token: ownerToken,
+    });
+
+    await new Promise((r) => setTimeout(r, 15));
+    const regDispatchRes = await apiRequest(`/api/orders/${regOrderId}/status`, {
+      method: 'PATCH',
+      token: riderToken,
+      body: { status: 'out_for_delivery', partnerId: 'dp-1', partnerName: 'Suresh Semwal' },
+    });
+    const adminAfterDispatchRes = await apiRequest('/api/orders/admin-all', { token: ownerToken });
+    const ownerDispatchedOrder = adminAfterDispatchRes.data?.orders?.find((o: any) => o.id === regOrderId);
+    const analyticsAfterDispatchRes = await apiRequest('/api/owner/analytics?timeRange=30d', {
+      token: ownerToken,
+    });
+
+    recordResult(
+      'READY and OUT_FOR_DELIVERY stay counted in Active Orders across Owner & Rider while preserving all historical events',
+      regReadyRes.status === 200 &&
+        riderReadyListRes.data?.orders?.some((o: any) => o.id === regOrderId && o.status === 'ready') &&
+        analyticsAfterReadyRes.data?.metrics?.activeOrdersCount === baselineActiveCount + 1 &&
+        regDispatchRes.status === 200 &&
+        ownerDispatchedOrder?.status === 'out_for_delivery' &&
+        analyticsAfterDispatchRes.data?.metrics?.activeOrdersCount === baselineActiveCount + 1 &&
+        ownerDispatchedOrder?.events?.map((e: any) => e.status).join(',') ===
+          'pending,accepted,preparing,ready,out_for_delivery',
+      `ready=${regReadyRes.status} dispatch=${regDispatchRes.status} owner=${ownerDispatchedOrder?.status}`
+    );
+
+    // 9d. Frontend pure status & Activity Stream regression check (latest Firestore doc precedence + newest-first stream)
+    const firestoreDocMockPreparing = normalizeOrderDocument('ORD-SYNC-PREP', {
+      id: 'ORD-SYNC-PREP',
+      status: 'PREPARING', // Uppercase Firestore value with oldest event still PENDING
+      kitchenName: "Sunita's Pahadi Rasoi",
+      customerName: 'Aarav Rawat',
+      createdAt: { seconds: Math.floor(Date.now() / 1000) - 3600, nanoseconds: 0 },
+      updatedAt: { seconds: Math.floor(Date.now() / 1000) - 60, nanoseconds: 0 },
+      events: [
+        { status: 'PENDING', timestamp: '2026-11-16T08:00:00.000Z', note: 'Placed' },
+        { status: 'ACCEPTED', timestamp: '2026-11-16T08:02:00.000Z', note: 'Accepted' },
+        { status: 'PREPARING', timestamp: '2026-11-16T08:05:00.000Z', note: 'Cooking now' },
+      ],
+    });
+    const readyDocMock = normalizeOrderDocument('ORD-SYNC-READY', {
+      status: 'READY',
+      events: [{ status: 'READY', timestamp: '2026-11-16T08:10:00.000Z', note: 'Ready' }],
+    });
+    const outDocMock = normalizeOrderDocument('ORD-SYNC-OUT', {
+      status: 'OUT_FOR_DELIVERY',
+      events: [{ status: 'OUT_FOR_DELIVERY', timestamp: '2026-11-16T08:12:00.000Z', note: 'Out' }],
+    });
+    const pendingDocMock = normalizeOrderDocument('ORD-SYNC-PEND', {
+      status: 'pending',
+      events: [{ status: 'pending', timestamp: '2026-11-16T08:01:00.000Z', note: 'Waiting' }],
+    });
+
+    const computedActive = computeActiveOrders([
+      firestoreDocMockPreparing,
+      readyDocMock,
+      outDocMock,
+      pendingDocMock,
+    ]);
+    const prepStream = buildActivityStreamEvents([firestoreDocMockPreparing]);
+
+    recordResult(
+      'Frontend helpers read latest doc status (PREPARING/READY/OUT_FOR_DELIVERY) and sort Activity Stream newest-first with preserved PENDING history',
+      getLatestOrderStatus(firestoreDocMockPreparing) === 'preparing' &&
+        computedActive.length === 3 &&
+        prepStream.length === 3 &&
+        prepStream[0].eventStatus === 'preparing' &&
+        prepStream[0].currentOrderStatus === 'preparing' &&
+        prepStream[2].eventStatus === 'pending' &&
+        prepStream[2].currentOrderStatus === 'preparing'
     );
 
     console.log('\n================================================================');

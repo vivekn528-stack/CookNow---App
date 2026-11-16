@@ -1,4 +1,5 @@
 import { getFirebaseAuth } from './firebase';
+import { normalizeOrderDocument, normalizeOrderStatus } from './order-status';
 import type { Order, CartItem, PaymentMethod } from '../types';
 
 export interface PlaceOrderPayload {
@@ -89,7 +90,7 @@ export async function placeCustomerOrder(
     if (res.ok && data?.success && data.order) {
       return {
         success: true,
-        order: data.order,
+        order: normalizeOrderDocument(data.order.id, data.order),
         error: null,
         fromServerFunction: true,
       };
@@ -130,7 +131,7 @@ export async function updateOrderStatusOnServer(
   orderId: string,
   status: string,
   options?: { cancellationReason?: string; partnerId?: string; partnerName?: string }
-): Promise<{ success: boolean; order?: Order; error?: string }> {
+): Promise<{ success: boolean; order?: Order; adminPersisted?: boolean; error?: string }> {
   const auth = getFirebaseAuth();
   const currentUser = auth?.currentUser;
   if (!currentUser) {
@@ -146,7 +147,7 @@ export async function updateOrderStatusOnServer(
         Authorization: `Bearer ${idToken}`,
       },
       body: JSON.stringify({
-        status,
+        status: normalizeOrderStatus(status),
         cancellationReason: options?.cancellationReason,
         partnerId: options?.partnerId,
         partnerName: options?.partnerName,
@@ -155,7 +156,11 @@ export async function updateOrderStatusOnServer(
 
     const data = await res.json().catch(() => null);
     if (res.ok && data?.success) {
-      return { success: true, order: data.order };
+      return {
+        success: true,
+        order: data.order ? normalizeOrderDocument(data.order.id || orderId, data.order) : undefined,
+        adminPersisted: Boolean(data.adminPersisted),
+      };
     }
     return {
       success: false,
@@ -166,10 +171,7 @@ export async function updateOrderStatusOnServer(
   }
 }
 
-/**
- * Fetch authenticated customer's own orders from server-authoritative backend
- */
-export async function fetchCustomerOrders(): Promise<{
+async function fetchRoleOrdersFromEndpoint(endpoint: string): Promise<{
   success: boolean;
   orders: Order[];
   error?: string;
@@ -183,7 +185,7 @@ export async function fetchCustomerOrders(): Promise<{
 
   try {
     const idToken = await currentUser.getIdToken();
-    const res = await fetch('/api/orders/my-orders', {
+    const res = await fetch(endpoint, {
       headers: {
         Authorization: `Bearer ${idToken}`,
       },
@@ -195,8 +197,56 @@ export async function fetchCustomerOrders(): Promise<{
     }
 
     const data = await res.json();
-    return { success: true, orders: data.orders || [] };
+    const rawOrders = Array.isArray(data?.orders) ? data.orders : [];
+    const normalized = rawOrders.map((o: any) => normalizeOrderDocument(o.id, o));
+    return { success: true, orders: normalized };
   } catch (err: any) {
     return { success: false, orders: [], error: err.message };
   }
+}
+
+/**
+ * Fetch authenticated customer's own orders from server-authoritative backend
+ */
+export async function fetchCustomerOrders(): Promise<{
+  success: boolean;
+  orders: Order[];
+  error?: string;
+}> {
+  return fetchRoleOrdersFromEndpoint('/api/orders/my-orders');
+}
+
+/**
+ * Fetch all live orders from server-authoritative Owner endpoint (/api/orders/admin-all)
+ */
+export async function fetchAdminOrders(): Promise<{
+  success: boolean;
+  orders: Order[];
+  error?: string;
+}> {
+  return fetchRoleOrdersFromEndpoint('/api/orders/admin-all');
+}
+
+/**
+ * Fetch cook kitchen orders from server-authoritative endpoint (/api/orders/kitchen-orders)
+ */
+export async function fetchKitchenOrders(cookId?: string): Promise<{
+  success: boolean;
+  orders: Order[];
+  error?: string;
+}> {
+  const qs = cookId ? `?cookId=${encodeURIComponent(cookId)}` : '';
+  return fetchRoleOrdersFromEndpoint(`/api/orders/kitchen-orders${qs}`);
+}
+
+/**
+ * Fetch delivery partner orders from server-authoritative endpoint (/api/orders/rider-orders)
+ */
+export async function fetchRiderOrders(riderId?: string): Promise<{
+  success: boolean;
+  orders: Order[];
+  error?: string;
+}> {
+  const qs = riderId ? `?riderId=${encodeURIComponent(riderId)}` : '';
+  return fetchRoleOrdersFromEndpoint(`/api/orders/rider-orders${qs}`);
 }

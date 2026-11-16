@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Clock, Eye, Star, RotateCcw, AlertCircle, ShoppingBag, CheckCircle2, LogIn, Headphones } from 'lucide-react';
 import { Order, MenuItem } from '../types';
 import { getMenuItemImage, getMenuItemAlt, FALLBACK_MEAL_IMAGE } from '../lib/image-registry';
+import { getLatestOrderStatus } from '../lib/order-status';
 
 interface CustomerOrdersViewProps {
   orders: Order[];
@@ -32,11 +33,12 @@ export const CustomerOrdersView: React.FC<CustomerOrdersViewProps> = ({
     : orders;
 
   const filteredOrders = scopedOrders.filter((o) => {
+    const status = getLatestOrderStatus(o);
     if (filter === 'active') {
-      return !['delivered', 'cancelled'].includes(o.status);
+      return !['delivered', 'cancelled'].includes(status);
     }
     if (filter === 'completed') {
-      return ['delivered', 'cancelled'].includes(o.status);
+      return ['delivered', 'cancelled'].includes(status);
     }
     return true;
   });
@@ -110,7 +112,7 @@ export const CustomerOrdersView: React.FC<CustomerOrdersViewProps> = ({
                 : 'text-stone-600 hover:text-stone-900'
             }`}
           >
-            All ({orders.length})
+            All ({scopedOrders.length})
           </button>
           <button
             onClick={() => setFilter('active')}
@@ -120,7 +122,7 @@ export const CustomerOrdersView: React.FC<CustomerOrdersViewProps> = ({
                 : 'text-stone-600 hover:text-stone-900'
             }`}
           >
-            Active ({orders.filter((o) => !['delivered', 'cancelled'].includes(o.status)).length})
+            Active ({scopedOrders.filter((o) => !['delivered', 'cancelled'].includes(getLatestOrderStatus(o))).length})
           </button>
           <button
             onClick={() => setFilter('completed')}
@@ -156,8 +158,9 @@ export const CustomerOrdersView: React.FC<CustomerOrdersViewProps> = ({
       ) : (
         <div className="space-y-4">
           {filteredOrders.map((order) => {
-            const isDelivered = order.status === 'delivered';
-            const isCancelled = order.status === 'cancelled';
+            const currentStatus = getLatestOrderStatus(order);
+            const isDelivered = currentStatus === 'delivered';
+            const isCancelled = currentStatus === 'cancelled';
             const isActive = !isDelivered && !isCancelled;
 
             return (
@@ -180,7 +183,7 @@ export const CustomerOrdersView: React.FC<CustomerOrdersViewProps> = ({
                             : 'bg-amber-100 text-amber-800'
                         }`}
                       >
-                        {order.status.replace(/_/g, ' ')}
+                        {currentStatus.replace(/_/g, ' ')}
                       </span>
                     </div>
                     <div className="text-xs text-stone-500 mt-0.5">

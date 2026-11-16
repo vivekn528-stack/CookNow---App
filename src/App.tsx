@@ -42,7 +42,19 @@ import {
 } from './types';
 import { OWNER_PROFILE, StorageManager } from './lib/storage';
 import { firestoreService } from './lib/firestore';
-import { placeCustomerOrder, updateOrderStatusOnServer } from './lib/order-service';
+import {
+  placeCustomerOrder,
+  updateOrderStatusOnServer,
+  fetchAdminOrders,
+  fetchCustomerOrders,
+  fetchKitchenOrders,
+  fetchRiderOrders,
+} from './lib/order-service';
+import {
+  normalizeOrderDocument,
+  normalizeOrderStatus,
+  parseTimestampMs,
+} from './lib/order-status';
 import { FALLBACK_KITCHEN_AVATAR } from './lib/image-registry';
 import {
   signOutFirebase,
@@ -88,7 +100,9 @@ export default function App() {
   // Master state from StorageManager
   const [cooks, setCooks] = useState<Cook[]>(() => StorageManager.getCooks());
   const [menuItems, setMenuItems] = useState<MenuItem[]>(() => StorageManager.getMenuItems());
-  const [orders, setOrders] = useState<Order[]>(() => StorageManager.getOrders());
+  const [orders, setOrders] = useState<Order[]>(() =>
+    StorageManager.getOrders().map((o) => normalizeOrderDocument(o.id, o))
+  );
   const [reviews, setReviews] = useState<Review[]>(() => StorageManager.getReviews());
   const [partnerApplications, setPartnerApplications] = useState<PartnerApplication[]>(() =>
     StorageManager.getPartnerApplications()
@@ -183,11 +197,18 @@ export default function App() {
       // 1. Primary: Cloud Firestore
       // Public customer query: strictly verified cooks (where isVerified == true)
       // Super Admin: also fetches unverified cooks for the administrative dashboard
+      const serverOrdersPromise = isSuperAdminSession
+        ? fetchAdminOrders()
+        : currentUser
+        ? fetchCustomerOrders()
+        : Promise.resolve({ success: false, orders: [] as Order[] });
+
       const [
         cooksRes,
         adminCooksRes,
         menuRes,
         ordersRes,
+        serverOrdersRes,
         reviewsRes,
         partnerRes,
         ridersRes,
@@ -202,6 +223,7 @@ export default function App() {
         isSuperAdminSession ? firestoreService.fetchCooks({ includeUnverified: true }) : Promise.resolve({ data: null, error: null, fromLiveBackend: false }),
         firestoreService.fetchMenuItems(),
         firestoreService.fetchOrders(),
+        serverOrdersPromise,
         firestoreService.fetchReviews(),
         firestoreService.fetchPartnerApplications(),
         firestoreService.fetchDeliveryPartners(),
@@ -237,8 +259,29 @@ export default function App() {
         queryErrors.push(`Menu items query: ${menuRes.error}`);
       }
 
-      if (ordersRes.data && ordersRes.fromLiveBackend && ordersRes.data.length > 0) {
-        setOrders(ordersRes.data);
+      const firestoreOrders = ordersRes.data && ordersRes.fromLiveBackend ? ordersRes.data : [];
+      const apiOrders = serverOrdersRes.success ? serverOrdersRes.orders : [];
+      if (firestoreOrders.length > 0 || apiOrders.length > 0) {
+        const mergedMap = new Map<string, Order>();
+        for (const o of [...firestoreOrders, ...apiOrders]) {
+          const norm = normalizeOrderDocument(o.id, o);
+          const prev = mergedMap.get(norm.id);
+          if (
+            !prev ||
+            parseTimestampMs(norm.updatedAt) > parseTimestampMs(prev.updatedAt) ||
+            (parseTimestampMs(norm.updatedAt) === parseTimestampMs(prev.updatedAt) &&
+              (norm.events?.length || 0) >= (prev.events?.length || 0))
+          ) {
+            mergedMap.set(norm.id, norm);
+          }
+        }
+        const mergedList = Array.from(mergedMap.values()).sort(
+          (a, b) => parseTimestampMs(b.createdAt) - parseTimestampMs(a.createdAt)
+        );
+        setOrders(mergedList);
+        liveEntitiesCount++;
+      } else if (isSuperAdminSession && ordersRes.fromLiveBackend && serverOrdersRes.success) {
+        setOrders([]);
         liveEntitiesCount++;
       }
       if (reviewsRes.data && reviewsRes.fromLiveBackend && reviewsRes.data.length > 0) {
@@ -338,6 +381,17 @@ export default function App() {
       } else {
         setCustomerProfile(null);
       }
+
+      const isVerifiedOwnerUser = Boolean(
+        user &&
+          user.email?.toLowerCase().trim() === 'vivekn528@gmail.com' &&
+          user.emailVerified
+      );
+      if (!isVerifiedOwnerUser && StorageManager.isOwnerAuthenticated()) {
+        StorageManager.setOwnerAuthenticated(false);
+        setIsOwnerAuthenticated(false);
+        setActiveTab((prev) => (prev === 'admin-dashboard' ? 'explore' : prev));
+      }
     });
     return () => unsubscribe();
   }, []);
@@ -391,6 +445,120 @@ export default function App() {
     StorageManager.saveSettings(settings);
   }, [settings]);
 
+  const syncOrdersFromBackend = async () => {
+    try {
+      const auth = getFirebaseAuth();
+      const currentUser = auth?.currentUser;
+      const isSuperAdminSession = Boolean(
+        isOwnerAuthenticated ||
+        (currentUser && currentUser.email?.toLowerCase().trim() === 'vivekn528@gmail.com' && currentUser.emailVerified)
+      );
+
+      const apiPromise = isSuperAdminSession
+        ? fetchAdminOrders()
+        : currentUser && currentRole === 'cook'
+        ? fetchKitchenOrders(currentCook?.id)
+        : currentUser && currentRole === 'delivery'
+        ? fetchRiderOrders(currentRider?.id)
+        : currentUser
+        ? fetchCustomerOrders()
+        : Promise.resolve({ success: false, orders: [] as Order[] });
+
+      const [fsRes, apiRes] = await Promise.all([
+        firestoreService.fetchOrders(),
+        apiPromise,
+      ]);
+
+      const firestoreOrders = fsRes.data && fsRes.fromLiveBackend ? fsRes.data : [];
+      const serverOrders = apiRes.success ? apiRes.orders : [];
+
+      if (firestoreOrders.length > 0 || serverOrders.length > 0) {
+        const mergedMap = new Map<string, Order>();
+        for (const raw of [...firestoreOrders, ...serverOrders]) {
+          const norm = normalizeOrderDocument(raw.id, raw);
+          const prev = mergedMap.get(norm.id);
+          if (
+            !prev ||
+            parseTimestampMs(norm.updatedAt) > parseTimestampMs(prev.updatedAt) ||
+            (parseTimestampMs(norm.updatedAt) === parseTimestampMs(prev.updatedAt) &&
+              (norm.events?.length || 0) >= (prev.events?.length || 0))
+          ) {
+            mergedMap.set(norm.id, norm);
+          }
+        }
+        const sorted = Array.from(mergedMap.values()).sort(
+          (a, b) => parseTimestampMs(b.createdAt) - parseTimestampMs(a.createdAt)
+        );
+        setOrders(sorted);
+      } else if (isSuperAdminSession && fsRes.fromLiveBackend && apiRes.success) {
+        setOrders([]);
+      }
+    } catch (err) {
+      console.warn('Order synchronization notice:', err);
+    }
+  };
+
+  // Real-time Firestore Snapshot Listener across Kitchen, Owner, Customer & Rider Dashboards
+  useEffect(() => {
+    const isSuperAdmin = Boolean(
+      isOwnerAuthenticated ||
+      (currentFirebaseUser &&
+        currentFirebaseUser.email?.toLowerCase().trim() === 'vivekn528@gmail.com' &&
+        currentFirebaseUser.emailVerified)
+    );
+    if (!isSuperAdmin && !currentFirebaseUser?.uid) return;
+
+    const unsubscribe = firestoreService.subscribeToOrders(
+      { isSuperAdmin, uid: currentFirebaseUser?.uid || null },
+      (liveOrders) => {
+        if (liveOrders.length > 0 || isSuperAdmin) {
+          setOrders((prev) => {
+            if (isSuperAdmin && liveOrders.length === 0) {
+              return prev.length === 0 ? [] : prev;
+            }
+            const mergedMap = new Map<string, Order>();
+            if (!isSuperAdmin) {
+              for (const existing of prev) {
+                const normPrev = normalizeOrderDocument(existing.id, existing);
+                mergedMap.set(normPrev.id, normPrev);
+              }
+            }
+            for (const incoming of liveOrders) {
+              const norm = normalizeOrderDocument(incoming.id, incoming);
+              const existing = mergedMap.get(norm.id);
+              if (
+                !existing ||
+                parseTimestampMs(norm.updatedAt) >= parseTimestampMs(existing.updatedAt)
+              ) {
+                mergedMap.set(norm.id, norm);
+              }
+            }
+            return Array.from(mergedMap.values()).sort(
+              (a, b) => parseTimestampMs(b.createdAt) - parseTimestampMs(a.createdAt)
+            );
+          });
+        }
+      },
+      (err) => {
+        console.warn('Real-time Firestore orders listener notice:', err?.message || err);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [currentFirebaseUser?.uid, currentFirebaseUser?.emailVerified, isOwnerAuthenticated]);
+
+  // Synchronize latest orders when switching operational dashboards
+  useEffect(() => {
+    if (
+      activeTab === 'admin-dashboard' ||
+      activeTab === 'cook-dashboard' ||
+      activeTab === 'delivery-dashboard' ||
+      activeTab === 'my-orders'
+    ) {
+      syncOrdersFromBackend();
+    }
+  }, [activeTab, currentRole, isOwnerAuthenticated]);
+
   // Keep trackedOrder in sync if orders change + Live Firestore Snapshot Subscription
   useEffect(() => {
     if (trackedOrder) {
@@ -404,8 +572,9 @@ export default function App() {
     if (!trackedOrder?.id) return;
     const unsubscribe = firestoreService.subscribeToOrder(trackedOrder.id, (liveOrder) => {
       if (liveOrder) {
-        setTrackedOrder(liveOrder);
-        setOrders((prev) => prev.map((o) => (o.id === liveOrder.id ? liveOrder : o)));
+        const normalized = normalizeOrderDocument(liveOrder.id, liveOrder);
+        setTrackedOrder(normalized);
+        setOrders((prev) => prev.map((o) => (o.id === normalized.id ? normalized : o)));
       }
     });
     return () => {
@@ -433,9 +602,11 @@ export default function App() {
       }
       setCurrentRole('admin');
       setActiveTab('admin-dashboard');
+      syncOrdersFromBackend();
       return;
     }
     setCurrentRole(role);
+    syncOrdersFromBackend();
   };
 
   // Cart Handlers
@@ -671,22 +842,25 @@ export default function App() {
     const targetOrder = orders.find((o) => o.id === orderId);
     if (!targetOrder) return;
 
-    if (!StorageManager.isValidOrderTransition(targetOrder.status, nextStatus)) {
-      showToast(`Invalid transition from ${targetOrder.status} to ${nextStatus}.`);
+    const currentNormalized = normalizeOrderStatus(targetOrder.status);
+    const nextNormalized = normalizeOrderStatus(nextStatus);
+
+    if (!StorageManager.isValidOrderTransition(currentNormalized, nextNormalized)) {
+      showToast(`Invalid transition from ${currentNormalized} to ${nextNormalized}.`);
       return;
     }
 
     const now = new Date().toISOString();
     const eventNote =
-      nextStatus === 'accepted'
+      nextNormalized === 'accepted'
         ? 'Accepted by kitchen. Ingredients being freshly prepared.'
-        : nextStatus === 'preparing'
+        : nextNormalized === 'preparing'
         ? 'Cooking in progress with fresh tawa rotis and spices.'
-        : nextStatus === 'ready'
+        : nextNormalized === 'ready'
         ? 'Meal prepared & packed in hygienic thermal container.'
-        : nextStatus === 'out_for_delivery'
+        : nextNormalized === 'out_for_delivery'
         ? 'Dispatched with local delivery partner to Nalapani Chowk.'
-        : nextStatus === 'delivered'
+        : nextNormalized === 'delivered'
         ? 'Successfully delivered to customer. COD payment pending hub remittance.'
         : reason || 'Order status updated.';
 
@@ -695,13 +869,13 @@ export default function App() {
         if (ord.id === orderId) {
           return {
             ...ord,
-            status: nextStatus,
-            cancellationReason: nextStatus === 'cancelled' ? reason : ord.cancellationReason,
+            status: nextNormalized,
+            cancellationReason: nextNormalized === 'cancelled' ? reason : ord.cancellationReason,
             paymentStatus: ord.paymentStatus,
             events: [
               ...ord.events,
               {
-                status: nextStatus,
+                status: nextNormalized,
                 timestamp: now,
                 note: eventNote,
               },
@@ -713,15 +887,29 @@ export default function App() {
       })
     );
 
-    // Sync with server-authoritative backend + Cloud Firestore
-    const serverRes = await updateOrderStatusOnServer(orderId, nextStatus, {
+    // Sync with server-authoritative backend first; apply authoritative order doc to state
+    const serverRes = await updateOrderStatusOnServer(orderId, nextNormalized, {
       cancellationReason: reason,
     });
-    const firestoreRes = await firestoreService.updateOrderStatus(orderId, nextStatus, reason);
-    if (!serverRes.success && firestoreRes.error) {
+
+    if (serverRes.success && serverRes.order) {
+      const authoritative = normalizeOrderDocument(serverRes.order.id, serverRes.order);
+      setOrders((prev) => prev.map((ord) => (ord.id === authoritative.id ? authoritative : ord)));
+      if (serverRes.adminPersisted === false) {
+        await firestoreService.updateOrderStatus(orderId, nextNormalized, eventNote);
+      }
+      showToast(`Order #${orderId} updated to ${nextNormalized.replace(/_/g, ' ')} in Cloud Firestore!`);
+      return;
+    }
+
+    // Fallback: direct Firestore update when server backend unavailable
+    const firestoreRes = await firestoreService.updateOrderStatus(orderId, nextNormalized, eventNote);
+    if (!firestoreRes.success) {
+      // Re-sync from Firestore so local optimistic state never stays out of sync with backend
+      await syncOrdersFromBackend();
       showToast(`⚠️ Status update notice: ${serverRes.error || firestoreRes.error}`);
     } else {
-      showToast(`Order #${orderId} updated to ${nextStatus.replace(/_/g, ' ')} in Cloud Firestore!`);
+      showToast(`Order #${orderId} updated to ${nextNormalized.replace(/_/g, ' ')} in Cloud Firestore!`);
     }
   };
 
@@ -732,23 +920,24 @@ export default function App() {
     partnerId: string,
     partnerName: string
   ) => {
+    const normalizedStatus = normalizeOrderStatus(status);
     const now = new Date().toISOString();
     setOrders((prev) =>
       prev.map((ord) => {
         if (ord.id === orderId) {
           return {
             ...ord,
-            status,
+            status: normalizedStatus,
             deliveryPartnerId: partnerId,
             deliveryPartnerName: partnerName,
-            deliveryStatus: status === 'delivered' ? 'delivered' : 'out_for_delivery',
+            deliveryStatus: normalizedStatus === 'delivered' ? 'delivered' : 'out_for_delivery',
             paymentStatus: ord.paymentStatus,
             events: [
               ...ord.events,
               {
-                status,
+                status: normalizedStatus,
                 timestamp: now,
-                note: `Delivery status updated by rider ${partnerName}: ${status}`,
+                note: `Delivery status updated by rider ${partnerName}: ${normalizedStatus}`,
               },
             ],
             updatedAt: now,
@@ -759,7 +948,7 @@ export default function App() {
     );
 
     // If delivered, update rider's balance
-    if (status === 'delivered') {
+    if (normalizedStatus === 'delivered') {
       setDeliveryPartners((prev) =>
         prev.map((dp) =>
           dp.id === partnerId
@@ -773,15 +962,27 @@ export default function App() {
       );
     }
 
-    // Primary: Server API + Cloud Firestore delivery partner assignment and status update
-    const deliveryStatus = status === 'delivered' ? 'delivered' : 'out_for_delivery';
-    const serverRes = await updateOrderStatusOnServer(orderId, status, { partnerId, partnerName });
+    // Primary: Server API; fallback to client Firestore only if Admin SDK did not persist
+    const deliveryStatus = normalizedStatus === 'delivered' ? 'delivered' : 'out_for_delivery';
+    const serverRes = await updateOrderStatusOnServer(orderId, normalizedStatus, { partnerId, partnerName });
+    if (serverRes.success && serverRes.order) {
+      const authoritative = normalizeOrderDocument(serverRes.order.id, serverRes.order);
+      setOrders((prev) => prev.map((ord) => (ord.id === authoritative.id ? authoritative : ord)));
+      if (serverRes.adminPersisted === false) {
+        await firestoreService.updateOrderDeliveryStatus(orderId, deliveryStatus, partnerId, partnerName);
+        await firestoreService.updateOrderStatus(orderId, normalizedStatus);
+      }
+      showToast(`Order #${orderId} delivery status: ${normalizedStatus.replace(/_/g, ' ')} (Firestore)`);
+      return;
+    }
+
     const firestoreRes = await firestoreService.updateOrderDeliveryStatus(orderId, deliveryStatus, partnerId, partnerName);
-    await firestoreService.updateOrderStatus(orderId, status);
-    if (!serverRes.success && firestoreRes.error) {
+    await firestoreService.updateOrderStatus(orderId, normalizedStatus);
+    if (!firestoreRes.success) {
+      await syncOrdersFromBackend();
       showToast(`⚠️ Rider update notice: ${serverRes.error || firestoreRes.error}`);
     } else {
-      showToast(`Order #${orderId} delivery status: ${status.replace(/_/g, ' ')} (Firestore)`);
+      showToast(`Order #${orderId} delivery status: ${normalizedStatus.replace(/_/g, ' ')} (Firestore)`);
     }
   };
 
@@ -1644,6 +1845,8 @@ export default function App() {
             }}
             onOpenSupabaseConfig={() => setIsSupabaseModalOpen(true)}
             onOpenDbGuide={() => setIsDbGuideOpen(true)}
+            onSyncOrders={syncOrdersFromBackend}
+            onNotify={showToast}
           />
         )}
       </main>
@@ -1743,6 +1946,8 @@ export default function App() {
           setIsOwnerAuthenticated(true);
           setCurrentRole('admin');
           setActiveTab('admin-dashboard');
+          loadLiveBackendData();
+          syncOrdersFromBackend();
           showToast(`Welcome, ${OWNER_PROFILE.fullName}! Super Admin session verified.`);
         }}
       />

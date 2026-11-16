@@ -318,9 +318,9 @@ service cloud.firestore {
     }
 
     match /support_tickets/{ticketId} {
-      // Only the filing customer or verified Super Admin can read a ticket
-      allow read: if isAuthenticated() && (
-        resource.data.customerId == request.auth.uid || isSuperAdmin()
+      // Verified Super Admin can read/list all tickets; customers can only read/list their own
+      allow read: if isSuperAdmin() || (
+        isAuthenticated() && resource.data.customerId == request.auth.uid
       );
 
       // Customers can create tickets for themselves with safe initial state (cannot pre-approve refunds or forge CSAT/assignee/resolution fields)
@@ -411,8 +411,8 @@ service cloud.firestore {
 
       // Public Communication Thread (Owner + Owning Customer only)
       match /messages/{messageId} {
-        allow read: if isAuthenticated() && (
-          isSuperAdmin() ||
+        allow read: if isSuperAdmin() || (
+          isAuthenticated() &&
           get(/databases/$(database)/documents/support_tickets/$(ticketId)).data.customerId == request.auth.uid
         );
 

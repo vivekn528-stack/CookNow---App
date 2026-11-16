@@ -15,6 +15,8 @@ import {
   writeBatch,
   Firestore,
   Unsubscribe,
+  Query,
+  DocumentData,
 } from 'firebase/firestore';
 import {
   getFirestoreDb,
@@ -41,6 +43,11 @@ import {
   OrderStatus,
   VerificationStatus,
 } from '../types';
+import {
+  normalizeOrderDocument,
+  normalizeOrderStatus,
+  parseTimestampMs,
+} from './order-status';
 
 export interface FirestoreOperationResult<T> {
   data: T | null;
@@ -355,8 +362,8 @@ export const firestoreService = {
         currentUser.emailVerified
       );
 
-      let q;
       if (isSuperAdmin) {
+        let q;
         if (filter?.customerId) {
           q = query(collection(db, 'orders'), where('customerId', '==', filter.customerId));
         } else if (filter?.cookId) {
@@ -366,19 +373,43 @@ export const firestoreService = {
         } else {
           q = query(collection(db, 'orders'));
         }
-      } else if (currentUser) {
-        // Authenticated Customer: strictly query orders where customerId == currentUser.uid
-        // Rules: resource.data.customerId == request.auth.uid
-        q = query(collection(db, 'orders'), where('customerId', '==', currentUser.uid));
-      } else {
-        // Anonymous visitor: no orders in Firestore
-        return { data: [], error: null, fromLiveBackend: false };
+        const snap = await getDocs(q);
+        const orders: Order[] = snap.docs.map((d) => normalizeOrderDocument(d.id, d.data()));
+        orders.sort((a, b) => parseTimestampMs(b.createdAt) - parseTimestampMs(a.createdAt));
+        return { data: orders, error: null, fromLiveBackend: true };
       }
 
-      const snap = await getDocs(q);
-      const orders: Order[] = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
-      orders.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-      return { data: orders, error: null, fromLiveBackend: true };
+      if (currentUser) {
+        // Query all Firestore order scopes permitted by firestore.rules for this UID
+        const settled = await Promise.allSettled([
+          getDocs(query(collection(db, 'orders'), where('customerId', '==', currentUser.uid))),
+          getDocs(query(collection(db, 'orders'), where('cookUserId', '==', currentUser.uid))),
+          getDocs(query(collection(db, 'orders'), where('deliveryPartnerUserId', '==', currentUser.uid))),
+        ]);
+
+        const merged = new Map<string, Order>();
+        let anySucceeded = false;
+        for (const result of settled) {
+          if (result.status === 'fulfilled') {
+            anySucceeded = true;
+            for (const d of result.value.docs) {
+              merged.set(d.id, normalizeOrderDocument(d.id, d.data()));
+            }
+          }
+        }
+
+        if (!anySucceeded) {
+          const firstErr = settled.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
+          return { data: null, error: firstErr?.reason?.message || 'Failed to read orders', fromLiveBackend: false };
+        }
+
+        const orders = Array.from(merged.values());
+        orders.sort((a, b) => parseTimestampMs(b.createdAt) - parseTimestampMs(a.createdAt));
+        return { data: orders, error: null, fromLiveBackend: true };
+      }
+
+      // Anonymous visitor: no orders in Firestore
+      return { data: [], error: null, fromLiveBackend: false };
     } catch (err: any) {
       return { data: null, error: err.message, fromLiveBackend: false };
     }
@@ -391,7 +422,7 @@ export const firestoreService = {
       if (!snap.exists()) {
         return { data: null, error: 'Order not found', fromLiveBackend: true };
       }
-      return { data: { id: snap.id, ...(snap.data() as any) }, error: null, fromLiveBackend: true };
+      return { data: normalizeOrderDocument(snap.id, snap.data()), error: null, fromLiveBackend: true };
     } catch (err: any) {
       return { data: null, error: err.message, fromLiveBackend: false };
     }
@@ -429,21 +460,23 @@ export const firestoreService = {
         return { success: false, error: 'Order not found.' };
       }
 
-      const existing = snap.data() as Order;
-      const events = existing.events || [];
+      const existing = normalizeOrderDocument(snap.id, snap.data());
+      const normalizedNext = normalizeOrderStatus(status);
+      const events = [...(existing.events || [])];
+      const nowIso = new Date().toISOString();
       events.push({
-        status,
-        timestamp: new Date().toISOString(),
-        note: reason || `Status changed to ${status}`,
+        status: normalizedNext,
+        timestamp: nowIso,
+        note: reason || `Status changed to ${normalizedNext}`,
       });
 
       const updates: any = {
-        status,
+        status: normalizedNext,
         events,
-        updatedAt: new Date().toISOString(),
+        updatedAt: nowIso,
       };
 
-      if (status === 'cancelled') {
+      if (normalizedNext === 'cancelled') {
         updates.cancellationReason = reason || 'Cancelled';
       }
       // CRITICAL: Delivering an order does NOT automatically collect COD cash.
@@ -540,19 +573,118 @@ export const firestoreService = {
     onUpdate: (order: Order) => void,
     onError?: (err: Error) => void
   ): Unsubscribe {
+    let cancelled = false;
     let unsub: Unsubscribe = () => {};
     getDb().then((db) => {
+      if (cancelled) return;
       unsub = onSnapshot(
         doc(db, 'orders', orderId),
         (snap) => {
           if (snap.exists()) {
-            onUpdate({ id: snap.id, ...(snap.data() as any) });
+            onUpdate(normalizeOrderDocument(snap.id, snap.data()));
           }
         },
         onError
       );
+    }).catch((err) => {
+      if (onError) onError(err as Error);
     });
-    return () => unsub();
+    return () => {
+      cancelled = true;
+      unsub();
+    };
+  },
+
+  // Real-time collection listener scoped strictly per firestore.rules
+  subscribeToOrders(
+    options: { isSuperAdmin?: boolean; uid?: string | null },
+    onUpdate: (orders: Order[]) => void,
+    onError?: (err: Error) => void
+  ): Unsubscribe {
+    let cancelled = false;
+    const unsubs: Unsubscribe[] = [];
+
+    getDb()
+      .then((db) => {
+        if (cancelled) return;
+
+        if (options.isSuperAdmin) {
+          const u = onSnapshot(
+            query(collection(db, 'orders')),
+            (snap) => {
+              const list = snap.docs.map((d) => normalizeOrderDocument(d.id, d.data()));
+              list.sort((a, b) => parseTimestampMs(b.createdAt) - parseTimestampMs(a.createdAt));
+              onUpdate(list);
+            },
+            onError
+          );
+          unsubs.push(u);
+          return;
+        }
+
+        if (options.uid) {
+          const buckets: Record<string, Map<string, Order>> = {
+            customer: new Map(),
+            cook: new Map(),
+            rider: new Map(),
+          };
+          const emitMerged = () => {
+            const combined = new Map<string, Order>();
+            for (const bucket of Object.values(buckets)) {
+              for (const [id, ord] of bucket.entries()) {
+                const prev = combined.get(id);
+                if (!prev || parseTimestampMs(ord.updatedAt) >= parseTimestampMs(prev.updatedAt)) {
+                  combined.set(id, ord);
+                }
+              }
+            }
+            const list = Array.from(combined.values());
+            list.sort((a, b) => parseTimestampMs(b.createdAt) - parseTimestampMs(a.createdAt));
+            onUpdate(list);
+          };
+
+          const queries: Array<[keyof typeof buckets, Query<DocumentData>]> = [
+            ['customer', query(collection(db, 'orders'), where('customerId', '==', options.uid))],
+            ['cook', query(collection(db, 'orders'), where('cookUserId', '==', options.uid))],
+            ['rider', query(collection(db, 'orders'), where('deliveryPartnerUserId', '==', options.uid))],
+          ];
+
+          for (const [bucketKey, q] of queries) {
+            const u = onSnapshot(
+              q,
+              (snap) => {
+                const nextMap = new Map<string, Order>();
+                for (const d of snap.docs) {
+                  nextMap.set(d.id, normalizeOrderDocument(d.id, d.data()));
+                }
+                buckets[bucketKey] = nextMap;
+                emitMerged();
+              },
+              (err) => {
+                // Only bubble non-permission errors or if customer scope failed
+                if (bucketKey === 'customer' && onError) {
+                  onError(err);
+                }
+              }
+            );
+            unsubs.push(u);
+          }
+        }
+      })
+      .catch((err) => {
+        if (onError) onError(err as Error);
+      });
+
+    return () => {
+      cancelled = true;
+      unsubs.forEach((u) => {
+        try {
+          u();
+        } catch {
+          // Ignore cleanup errors
+        }
+      });
+    };
   },
 
   // =========================================================================

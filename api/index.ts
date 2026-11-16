@@ -533,12 +533,93 @@ for (const exp of INITIAL_EXPENSES_SEED) {
   LIVE_EXPENSES_CACHE.set(exp.id, exp);
 }
 
+function parseServerTimestampMs(value: unknown): number {
+  if (!value) return 0;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  if (typeof value === 'string') {
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  if (typeof value === 'object') {
+    const obj = value as Record<string, any>;
+    if (typeof obj.toDate === 'function') {
+      const d = obj.toDate();
+      const ms = d instanceof Date ? d.getTime() : NaN;
+      return Number.isFinite(ms) ? ms : 0;
+    }
+    const seconds =
+      typeof obj.seconds === 'number'
+        ? obj.seconds
+        : typeof obj._seconds === 'number'
+        ? obj._seconds
+        : null;
+    if (seconds !== null) {
+      const nanos =
+        typeof obj.nanoseconds === 'number'
+          ? obj.nanoseconds
+          : typeof obj._nanoseconds === 'number'
+          ? obj._nanoseconds
+          : 0;
+      return Math.round(seconds * 1000 + nanos / 1e6);
+    }
+  }
+  return 0;
+}
+
+function normalizeServerTimestampIso(value: unknown, fallbackIso?: string): string {
+  const ms = parseServerTimestampMs(value);
+  if (ms > 0) return new Date(ms).toISOString();
+  if (fallbackIso) {
+    const fbMs = parseServerTimestampMs(fallbackIso);
+    if (fbMs > 0) return new Date(fbMs).toISOString();
+  }
+  return new Date(0).toISOString();
+}
+
+function normalizeServerOrderStatus(rawStatus: unknown): string {
+  if (typeof rawStatus !== 'string') return 'pending';
+  return rawStatus.trim().toLowerCase().replace(/[\s-]+/g, '_');
+}
+
+function normalizeServerOrder(id: string, raw: any): any {
+  const createdAt = normalizeServerTimestampIso(raw?.createdAt, new Date().toISOString());
+  const updatedAt = normalizeServerTimestampIso(raw?.updatedAt || createdAt, createdAt);
+  const currentStatus = normalizeServerOrderStatus(raw?.status);
+  const normalizedEvents = Array.isArray(raw?.events)
+    ? raw.events.map((evt: any) => ({
+        status: normalizeServerOrderStatus(evt?.status ?? currentStatus),
+        timestamp: normalizeServerTimestampIso(evt?.timestamp || createdAt, createdAt),
+        note: typeof evt?.note === 'string' && evt.note.trim() ? evt.note : `Status: ${normalizeServerOrderStatus(evt?.status ?? currentStatus)}`,
+      }))
+    : [
+        {
+          status: currentStatus,
+          timestamp: createdAt,
+          note: `Order recorded with status ${currentStatus}.`,
+        },
+      ];
+
+  return {
+    ...(raw || {}),
+    id: raw?.id || id,
+    status: currentStatus,
+    createdAt,
+    updatedAt,
+    ...(raw?.reconciledAt ? { reconciledAt: normalizeServerTimestampIso(raw.reconciledAt, updatedAt) } : {}),
+    events: normalizedEvents,
+  };
+}
+
 async function fetchOrdersFromFirestoreOrCache(): Promise<any[]> {
   if (hasAdminCredentials && firestoreDb) {
     try {
       const snap = await firestoreDb.collection('orders').get();
       if (!snap.empty) {
-        const list = snap.docs.map((d: any) => ({ id: d.id, ...d.data() }));
+        const list = snap.docs.map((d: any) => normalizeServerOrder(d.id, d.data()));
         for (const o of list) {
           LIVE_ORDERS_CACHE.set(o.id, o);
         }
@@ -548,7 +629,7 @@ async function fetchOrdersFromFirestoreOrCache(): Promise<any[]> {
       // Fallback to in-memory cache
     }
   }
-  return Array.from(LIVE_ORDERS_CACHE.values());
+  return Array.from(LIVE_ORDERS_CACHE.values()).map((o) => normalizeServerOrder(o.id, o));
 }
 
 async function fetchExpensesFromFirestoreOrCache(): Promise<any[]> {
@@ -592,7 +673,7 @@ async function fetchSingleOrder(orderId: string): Promise<any | null> {
     try {
       const snap = await firestoreDb.collection('orders').doc(orderId).get();
       if (snap.exists) {
-        const order = { id: snap.id, ...snap.data() };
+        const order = normalizeServerOrder(snap.id, snap.data());
         LIVE_ORDERS_CACHE.set(order.id, order);
         return order;
       }
@@ -600,7 +681,8 @@ async function fetchSingleOrder(orderId: string): Promise<any | null> {
       console.error('[Firestore] Failed reading single order:', { orderId, code: err?.code, message: err?.message });
     }
   }
-  return LIVE_ORDERS_CACHE.get(orderId) || null;
+  const cached = LIVE_ORDERS_CACHE.get(orderId);
+  return cached ? normalizeServerOrder(cached.id || orderId, cached) : null;
 }
 
 async function fetchSingleExpense(expenseId: string): Promise<any | null> {
@@ -1318,7 +1400,7 @@ router.get('/orders/my-orders', asyncHandler(async (req: Request, res: Response)
   const customerOrders = allOrders.filter((order) => order.customerId === verifiedUser.uid);
 
   customerOrders.sort(
-    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    (a, b) => parseServerTimestampMs(b.createdAt) - parseServerTimestampMs(a.createdAt)
   );
 
   return res.json({ success: true, orders: customerOrders });
@@ -1368,6 +1450,9 @@ router.get('/orders/kitchen-orders', asyncHandler(async (req: Request, res: Resp
       ? order.cookId === requestedCookId
       : authorizedCookIds.includes(order.cookId) || order.cookUserId === verifiedUser.uid;
   });
+  kitchenOrders.sort(
+    (a, b) => parseServerTimestampMs(b.createdAt) - parseServerTimestampMs(a.createdAt)
+  );
 
   return res.json({ success: true, orders: kitchenOrders });
 }));
@@ -1423,6 +1508,9 @@ router.get('/orders/rider-orders', asyncHandler(async (req: Request, res: Respon
     const unassignedReady = order.status === 'ready' && !order.deliveryPartnerId;
     return assignedToMe || unassignedReady;
   });
+  riderOrders.sort(
+    (a, b) => parseServerTimestampMs(b.createdAt) - parseServerTimestampMs(a.createdAt)
+  );
 
   return res.json({ success: true, orders: riderOrders });
 }));
@@ -1443,7 +1531,7 @@ router.get('/orders/admin-all', asyncHandler(async (req: Request, res: Response)
 
   const allOrders = await fetchOrdersFromFirestoreOrCache();
   allOrders.sort(
-    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    (a, b) => parseServerTimestampMs(b.createdAt) - parseServerTimestampMs(a.createdAt)
   );
 
   return res.json({ success: true, orders: allOrders });
@@ -1457,10 +1545,11 @@ router.patch('/orders/:orderId/status', asyncHandler(async (req: Request, res: R
   }
 
   const { orderId } = req.params;
-  const { status, cancellationReason, partnerId, partnerName } = req.body || {};
+  const { status: rawStatus, cancellationReason, partnerId, partnerName } = req.body || {};
+  const status = normalizeServerOrderStatus(rawStatus);
 
-  if (!status || !Object.prototype.hasOwnProperty.call(ALLOWED_ORDER_TRANSITIONS, status)) {
-    return res.status(400).json({ success: false, error: `Invalid order status: "${status}".` });
+  if (!rawStatus || !Object.prototype.hasOwnProperty.call(ALLOWED_ORDER_TRANSITIONS, status)) {
+    return res.status(400).json({ success: false, error: `Invalid order status: "${rawStatus}".` });
   }
 
   const order = await fetchSingleOrder(orderId);
@@ -1468,12 +1557,14 @@ router.patch('/orders/:orderId/status', asyncHandler(async (req: Request, res: R
     return res.status(404).json({ success: false, error: 'Order not found.' });
   }
 
+  const currentStatus = normalizeServerOrderStatus(order.status);
+
   // Validate state machine transition
-  const allowedNext = ALLOWED_ORDER_TRANSITIONS[order.status] || [];
+  const allowedNext = ALLOWED_ORDER_TRANSITIONS[currentStatus] || [];
   if (!allowedNext.includes(status)) {
     return res.status(400).json({
       success: false,
-      error: `Invalid status transition from "${order.status}" to "${status}".`,
+      error: `Invalid status transition from "${currentStatus}" to "${status}".`,
     });
   }
 
@@ -1574,6 +1665,16 @@ router.patch('/orders/:orderId/status', asyncHandler(async (req: Request, res: R
   if (hasAdminCredentials && firestoreDb) {
     try {
       await firestoreDb.collection('orders').doc(orderId).set(order, { merge: true });
+      await firestoreDb.collection('audit_logs').doc(`order_status_${orderId}_${Date.now()}`).set({
+        action: 'ORDER_STATUS_UPDATED',
+        targetType: 'order',
+        targetId: orderId,
+        previousStatus: currentStatus,
+        newStatus: status,
+        actorUid: verifiedUser.uid,
+        actorEmail: verifiedUser.email,
+        createdAt: nowIso,
+      });
     } catch (fsErr: any) {
       console.error('[Orders] Failed updating order status in Firestore:', {
         orderId,
@@ -1589,7 +1690,11 @@ router.patch('/orders/:orderId/status', asyncHandler(async (req: Request, res: R
 
   LIVE_ORDERS_CACHE.set(orderId, order);
   persistOrders();
-  return res.json({ success: true, order });
+  return res.json({
+    success: true,
+    order,
+    adminPersisted: Boolean(hasAdminCredentials && firestoreDb),
+  });
 }));
 
 // 8. Explicit COD Remittance Confirmation Endpoint (Founder/Owner Reconciled)
@@ -1736,18 +1841,25 @@ router.get('/owner/analytics', asyncHandler(async (req: Request, res: Response) 
   }
 
   const filteredOrders = cutoffMs > 0
-    ? allOrders.filter((o) => new Date(o.createdAt).getTime() >= cutoffMs)
+    ? allOrders.filter((o) => parseServerTimestampMs(o.createdAt) >= cutoffMs)
     : allOrders;
 
   const filteredExpenses = cutoffMs > 0
-    ? allExpenses.filter((e) => new Date(e.date).getTime() >= cutoffMs)
+    ? allExpenses.filter((e) => parseServerTimestampMs(e.date) >= cutoffMs)
     : allExpenses;
 
-  // Order status segmentation
-  const deliveredOrders = filteredOrders.filter((o) => o.status === 'delivered');
-  const cancelledOrders = filteredOrders.filter((o) => o.status === 'cancelled');
-  const activeOrders = filteredOrders.filter((o) =>
-    ['pending', 'accepted', 'preparing', 'ready', 'out_for_delivery'].includes(o.status)
+  // Order status segmentation (always calculated from latest order doc status, never historical events)
+  const deliveredOrders = filteredOrders.filter((o) => normalizeServerOrderStatus(o.status) === 'delivered');
+  const cancelledOrders = filteredOrders.filter((o) => normalizeServerOrderStatus(o.status) === 'cancelled');
+  // Active Orders: strictly PREPARING, READY, and OUT_FOR_DELIVERY from latest Firestore order documents
+  const activeOrders = allOrders.filter((o) =>
+    ['preparing', 'ready', 'out_for_delivery'].includes(normalizeServerOrderStatus(o.status))
+  );
+  const awaitingKitchenOrders = allOrders.filter((o) =>
+    ['pending', 'accepted'].includes(normalizeServerOrderStatus(o.status))
+  );
+  const openCodOrders = filteredOrders.filter((o) =>
+    ['pending', 'accepted', 'preparing', 'ready', 'out_for_delivery'].includes(normalizeServerOrderStatus(o.status))
   );
 
   // Core Financial Aggregations
@@ -1784,8 +1896,8 @@ router.get('/owner/analytics', asyncHandler(async (req: Request, res: Response) 
   const codDeliveredPendingOrders = deliveredOrders.filter(
     (o) => o.paymentMethod === 'cod' && o.paymentStatus !== 'paid'
   );
-  // 3. Doorstep COD in courier transit: Active orders dispatched or in kitchen
-  const codInTransitOrders = activeOrders.filter((o) => o.paymentMethod === 'cod');
+  // 3. Doorstep COD in courier transit / open fulfillment: Non-terminal COD orders
+  const codInTransitOrders = openCodOrders.filter((o) => o.paymentMethod === 'cod');
 
   const cashCollected = codPaidOrders.reduce((sum, o) => sum + (o.finalPayableAmount || 0), 0);
   const codDeliveredPendingRemittance = codDeliveredPendingOrders.reduce(
@@ -1985,6 +2097,7 @@ router.get('/owner/analytics', asyncHandler(async (req: Request, res: Response) 
       deliveredOrdersCount: deliveredOrders.length,
       cancelledOrdersCount: cancelledOrders.length,
       activeOrdersCount: activeOrders.length,
+      awaitingKitchenCount: awaitingKitchenOrders.length,
       totalUniqueCustomers,
       repeatCustomerRate,
     },

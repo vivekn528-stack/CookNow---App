@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   Headphones,
   Search,
@@ -147,10 +147,11 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
   const [stats, setStats] = useState<SupportTicketStats>(EMPTY_STATS);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [adminPersisted, setAdminPersisted] = useState<boolean>(true);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
 
   // Filters state
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [priorityFilter, setPriorityFilter] = useState('all');
   const [categoryFilter, setCategoryFilter] = useState('all');
@@ -188,9 +189,37 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
   const [refundError, setRefundError] = useState<string | null>(null);
   const [isSavingRefund, setIsSavingRefund] = useState(false);
 
+  const fetchSeqRef = useRef(0);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showActionNotice = useCallback(
+    (msg: string) => {
+      setActionNotice(msg);
+      if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+      noticeTimerRef.current = setTimeout(() => {
+        setActionNotice(null);
+      }, 4500);
+      onNotify?.(msg);
+    },
+    [onNotify]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchQuery.trim());
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
   const currentFilters: SupportTicketFilter = useMemo(
     () => ({
-      search: searchQuery.trim() || undefined,
+      search: debouncedSearch || undefined,
       status: statusFilter,
       priority: priorityFilter,
       category: categoryFilter,
@@ -198,22 +227,26 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
       dateTo: dateTo || undefined,
       unreadOnly,
     }),
-    [searchQuery, statusFilter, priorityFilter, categoryFilter, dateFrom, dateTo, unreadOnly]
+    [debouncedSearch, statusFilter, priorityFilter, categoryFilter, dateFrom, dateTo, unreadOnly]
   );
 
   const loadTickets = useCallback(async () => {
+    const reqSeq = ++fetchSeqRef.current;
     setIsLoading(true);
     setLoadError(null);
     try {
       const res = await supportService.fetchOwnerTickets(currentFilters);
+      if (reqSeq !== fetchSeqRef.current) return;
       setTickets(res.tickets);
       setStats(res.stats);
-      setAdminPersisted(res.adminPersisted);
       onStatsChange?.(res.stats);
     } catch (err: any) {
+      if (reqSeq !== fetchSeqRef.current) return;
       setLoadError(err?.message || 'Failed loading support tickets from Firestore.');
     } finally {
-      setIsLoading(false);
+      if (reqSeq === fetchSeqRef.current) {
+        setIsLoading(false);
+      }
     }
   }, [currentFilters, onStatsChange]);
 
@@ -315,7 +348,7 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
       );
       setSelectedTicket(updated);
       await loadTickets();
-      onNotify?.(`Ticket ${updated.id} updated.`);
+      showActionNotice(`Ticket ${updated.id} updated.`);
     } catch (err: any) {
       setDetailError(err?.message || 'Failed updating ticket properties.');
     } finally {
@@ -340,7 +373,7 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
       setReplyText('');
       setReplyNextStatus('');
       await loadTickets();
-      onNotify?.('Customer reply saved to Firestore support thread.');
+      showActionNotice('Customer reply saved to Firestore support thread.');
     } catch (err: any) {
       setDetailError(err?.message || 'Failed sending reply.');
     } finally {
@@ -362,7 +395,7 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
       setInternalNotes((prev) => [...prev, res.note]);
       setSelectedTicket(res.ticket);
       setInternalNoteText('');
-      onNotify?.('Staff-only internal note recorded.');
+      showActionNotice('Staff-only internal note recorded.');
     } catch (err: any) {
       setDetailError(err?.message || 'Failed saving staff internal note.');
     } finally {
@@ -408,7 +441,7 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
       );
       setSelectedTicket(updated);
       await loadTickets();
-      onNotify?.(`Refund status updated to "${refundStatusInput}" with audit trail.`);
+      showActionNotice(`Refund status updated to "${refundStatusInput}" with audit trail.`);
     } catch (err: any) {
       setRefundError(err?.message || 'Failed updating refund decision.');
     } finally {
@@ -418,6 +451,7 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
 
   const clearAllFilters = () => {
     setSearchQuery('');
+    setDebouncedSearch('');
     setStatusFilter('all');
     setPriorityFilter('all');
     setCategoryFilter('all');
@@ -462,19 +496,33 @@ export const CustomerCareTab: React.FC<CustomerCareTabProps> = ({
         </div>
 
         <div className="flex items-center gap-2 self-start sm:self-auto">
-          <span className="text-[11px] font-medium px-2.5 py-1 rounded-lg bg-slate-100 text-slate-600 border border-slate-200">
-            {adminPersisted ? 'Server Admin + Firestore Active' : 'Authenticated Client Firestore Sync'}
-          </span>
           <button
             onClick={loadTickets}
             disabled={isLoading}
-            className="px-3 py-1.5 bg-emerald-800 hover:bg-emerald-900 disabled:opacity-60 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
+            className="px-3.5 py-2 bg-emerald-800 hover:bg-emerald-900 disabled:opacity-60 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
             <span>Refresh</span>
           </button>
         </div>
       </div>
+
+      {actionNotice && (
+        <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-xs flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+            <span>{actionNotice}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActionNotice(null)}
+            aria-label="Dismiss notification"
+            className="p-1 text-emerald-700 hover:text-emerald-950 cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* A. Support Overview KPIs (Strictly from live Firestore records) */}
       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">

@@ -66,6 +66,16 @@ import {
   STAGE1_PLANNED_DOCUMENTS,
   Stage1ImportResult,
 } from '../lib/catalog-importer';
+import {
+  buildActivityStreamEvents,
+  computeActiveOrders,
+  computeAwaitingKitchenOrders,
+  formatOrderStatusLabel,
+  getLatestOrderStatus,
+  isInFlightOrderStatus,
+  normalizeOrderDocument,
+  parseTimestampMs,
+} from '../lib/order-status';
 
 export type AdminDashboardTab =
   | 'overview'
@@ -119,6 +129,8 @@ export interface AdminDashboardProps {
   onSignOutOwner: () => void;
   onOpenSupabaseConfig?: () => void;
   onOpenDbGuide?: () => void;
+  onSyncOrders?: () => Promise<void> | void;
+  onNotify?: (message: string) => void;
 }
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({
@@ -153,6 +165,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onSignOutOwner,
   onOpenSupabaseConfig,
   onOpenDbGuide,
+  onSyncOrders,
+  onNotify,
 }) => {
   // Navigation State
   const [activeTab, setActiveTab] = useState<AdminDashboardTab>('overview');
@@ -185,7 +199,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [rejectReason, setRejectReason] = useState('');
 
   // Settlement tracking state (marked payouts)
-  const [settledPayouts, setSettledPayouts] = useState<Record<string, { settledAt: string; ref: string }>>({});
+  const [settledPayouts, setSettledPayouts] = useState<
+    Record<string, { settledAt: string; ref: string; amount: number; targetType?: 'cook' | 'rider' }>
+  >({});
 
   // Settings form states
   const [commissionInput, setCommissionInput] = useState(settings.commissionRatePercent.toString());
@@ -234,12 +250,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     let isMounted = true;
     firestoreService.fetchSettlements().then((res) => {
       if (isMounted && res.data && res.data.length > 0) {
-        const map: Record<string, { settledAt: string; ref: string }> = {};
+        const map: Record<string, { settledAt: string; ref: string; amount: number; targetType?: 'cook' | 'rider' }> = {};
         for (const s of res.data) {
           if (s.targetId) {
             map[s.targetId] = {
               settledAt: s.settledAt || new Date().toISOString(),
               ref: s.referenceNumber || s.ref || 'TXN-SETTLED',
+              amount: Number(s.amount || 0),
+              targetType: s.targetType === 'cook' || s.targetType === 'rider' ? s.targetType : undefined,
             };
           }
         }
@@ -295,11 +313,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     return () => clearInterval(interval);
   }, []);
 
-  // Live timer tick for auto-refresh
+  const onSyncOrdersRef = useRef(onSyncOrders);
+  useEffect(() => {
+    onSyncOrdersRef.current = onSyncOrders;
+  }, [onSyncOrders]);
+
+  const runLiveSync = async () => {
+    setIsSyncing(true);
+    try {
+      await onSyncOrdersRef.current?.();
+    } finally {
+      setIsSyncing(false);
+      setSyncCountdown(30);
+      setLastSyncTime(new Date().toLocaleTimeString('en-IN'));
+    }
+  };
+
+  // Live timer tick for real auto-refresh
   useEffect(() => {
     const timer = setInterval(() => {
       setSyncCountdown((prev) => {
         if (prev <= 1) {
+          void onSyncOrdersRef.current?.();
           setLastSyncTime(new Date().toLocaleTimeString('en-IN'));
           return 30;
         }
@@ -310,17 +345,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   }, []);
 
   const handleManualSync = () => {
-    setIsSyncing(true);
-    setTimeout(() => {
-      setIsSyncing(false);
-      setSyncCountdown(30);
-      setLastSyncTime(new Date().toLocaleTimeString('en-IN'));
-    }, 600);
+    void runLiveSync();
   };
+
+  // Always normalize latest Firestore order documents (status strictly from order.status, safe timestamps)
+  const normalizedOrders = useMemo(
+    () => orders.map((o) => normalizeOrderDocument(o.id, o)),
+    [orders]
+  );
 
   // Filter orders by selected time range
   const filteredOrders = useMemo(() => {
-    if (timeRange === 'all') return orders;
+    if (timeRange === 'all') return normalizedOrders;
     const now = new Date();
     const nowMs = now.getTime();
     let cutoff = 0;
@@ -339,8 +375,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       cutoff = new Date(now.getFullYear(), now.getMonth() - 1, 1).getTime();
     }
 
-    return orders.filter((o) => new Date(o.createdAt).getTime() >= cutoff);
-  }, [orders, timeRange]);
+    return normalizedOrders.filter((o) => parseTimestampMs(o.createdAt) >= cutoff);
+  }, [normalizedOrders, timeRange]);
 
   // Filter expenses by selected time range
   const filteredExpenses = useMemo(() => {
@@ -363,16 +399,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       cutoff = new Date(now.getFullYear(), now.getMonth() - 1, 1).getTime();
     }
 
-    return expenses.filter((e) => new Date(e.date).getTime() >= cutoff);
+    return expenses.filter((e) => parseTimestampMs(e.date) >= cutoff);
   }, [expenses, timeRange]);
 
   // ----------------------------------------------------------------------------
   // ALL 20 FINANCIAL METRICS & WATERFALL CALCULATIONS (Exact business formulas)
   // ----------------------------------------------------------------------------
-  const deliveredOrders = useMemo(() => filteredOrders.filter((o) => o.status === 'delivered'), [filteredOrders]);
-  const cancelledOrders = useMemo(() => filteredOrders.filter((o) => o.status === 'cancelled'), [filteredOrders]);
+  const deliveredOrders = useMemo(
+    () => filteredOrders.filter((o) => getLatestOrderStatus(o) === 'delivered'),
+    [filteredOrders]
+  );
+  const cancelledOrders = useMemo(
+    () => filteredOrders.filter((o) => getLatestOrderStatus(o) === 'cancelled'),
+    [filteredOrders]
+  );
+  // Active Orders strictly calculate current status from latest Firestore order documents:
+  // PREPARING, READY, and OUT_FOR_DELIVERY
   const activeOrders = useMemo(
-    () => filteredOrders.filter((o) => ['pending', 'accepted', 'preparing', 'ready', 'out_for_delivery'].includes(o.status)),
+    () => computeActiveOrders(normalizedOrders),
+    [normalizedOrders]
+  );
+  const awaitingKitchenOrders = useMemo(
+    () => computeAwaitingKitchenOrders(normalizedOrders),
+    [normalizedOrders]
+  );
+  const inFlightCodOrders = useMemo(
+    () => filteredOrders.filter((o) => isInFlightOrderStatus(o.status)),
     [filteredOrders]
   );
 
@@ -430,15 +482,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     [deliveredOrders]
   );
 
-  // 12. Cash in Transit / Doorstep COD (Active orders)
+  // 12. Cash in Transit / Doorstep COD (Open in-flight COD orders)
   const codInTransitOrders = useMemo(
-    () => activeOrders.filter((o) => o.paymentMethod === 'cod'),
-    [activeOrders]
+    () => inFlightCodOrders.filter((o) => o.paymentMethod === 'cod'),
+    [inFlightCodOrders]
   );
   const cashInTransit = useMemo(
     () => codInTransitOrders.reduce((sum, o) => sum + (o.finalPayableAmount || 0), 0),
     [codInTransitOrders]
   );
+
+  // Activity Stream: keep PENDING, ACCEPTED, PREPARING, READY, OUT_FOR_DELIVERY as historical records
+  // sorted newest-first with timestamps and the order's current live status
+  const activityStreamEvents = useMemo(() => {
+    const map = new Map<string, Order>();
+    for (const o of filteredOrders) map.set(o.id, o);
+    for (const o of activeOrders) map.set(o.id, o);
+    for (const o of awaitingKitchenOrders) map.set(o.id, o);
+    return buildActivityStreamEvents(Array.from(map.values()));
+  }, [filteredOrders, activeOrders, awaitingKitchenOrders]);
 
   // 13. Cash Collected (ONLY Delivered COD orders where paymentStatus === 'paid')
   const codPaidOrders = useMemo(
@@ -480,14 +542,60 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // 18. Net Profit / Operating Result (= Gross Profit - Operating Expenses)
   const netProfit = grossProfit - totalOperatingExpenses;
 
-  // 19. Outstanding Liabilities (Cook payouts due + Rider payouts due minus settled)
-  const totalSettledVal = useMemo(
-    () => Object.values(settledPayouts).reduce((sum) => sum + 1, 0),
-    [settledPayouts]
+  // 19. Outstanding Liabilities (Cook payouts due + Rider payouts due minus actual settled amounts)
+  const cookIdsSet = useMemo(() => new Set(cooks.map((c) => c.id)), [cooks]);
+  const riderIdsSet = useMemo(() => new Set(deliveryPartners.map((dp) => dp.id)), [deliveryPartners]);
+  const totalSettledCookVal = useMemo(
+    () =>
+      Object.entries(settledPayouts).reduce((sum, [id, s]) => {
+        if (s.targetType === 'cook' || (!s.targetType && cookIdsSet.has(id))) {
+          return sum + (Number(s.amount) || 0);
+        }
+        return sum;
+      }, 0),
+    [settledPayouts, cookIdsSet]
   );
-  const outstandingCooksOwed = Math.max(0, cookPayouts - totalSettledVal * 200);
-  const outstandingRidersOwed = deliveryExpensesPaid;
+  const totalSettledRiderVal = useMemo(
+    () =>
+      Object.entries(settledPayouts).reduce((sum, [id, s]) => {
+        if (s.targetType === 'rider' || (!s.targetType && riderIdsSet.has(id))) {
+          return sum + (Number(s.amount) || 0);
+        }
+        return sum;
+      }, 0),
+    [settledPayouts, riderIdsSet]
+  );
+  const outstandingCooksOwed = Math.max(0, cookPayouts - totalSettledCookVal);
+  const outstandingRidersOwed = Math.max(0, deliveryExpensesPaid - totalSettledRiderVal);
   const outstandingLiabilities = outstandingCooksOwed + outstandingRidersOwed;
+
+  // Live current calendar month net revenue & delivered order count (independent of active timeRange filter)
+  const { thisMonthNetRevenue, thisMonthDeliveredCount } = useMemo(() => {
+    const now = new Date();
+    const monthStartMs = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+    let netRev = 0;
+    let count = 0;
+    for (const o of normalizedOrders) {
+      if (getLatestOrderStatus(o) === 'delivered' && parseTimestampMs(o.createdAt) >= monthStartMs) {
+        netRev += (o.platformCommission || 0) + (o.platformFee || 0);
+        count += 1;
+      }
+    }
+    return { thisMonthNetRevenue: netRev, thisMonthDeliveredCount: count };
+  }, [normalizedOrders]);
+
+  // Average kitchen rating derived from live reviews & cook records
+  const averageKitchenRating = useMemo(() => {
+    if (reviews.length > 0) {
+      const avg = reviews.reduce((s, r) => s + (Number(r.rating) || 0), 0) / reviews.length;
+      return avg.toFixed(1);
+    }
+    if (cooks.length > 0) {
+      const avg = cooks.reduce((s, c) => s + (Number(c.rating) || 0), 0) / cooks.length;
+      return avg.toFixed(1);
+    }
+    return '—';
+  }, [reviews, cooks]);
 
   // 20. Average Order Value (AOV)
   const averageOrderValue = deliveredOrders.length > 0 ? Math.round(grossSalesGMV / deliveredOrders.length) : 0;
@@ -667,7 +775,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       <div className="bg-slate-950 text-white rounded-2xl p-6 shadow-xl border border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-5">
         <div className="space-y-2">
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <span className="w-2 h-2 rounded-full bg-emerald-400" />
             <span className="font-semibold text-slate-400 uppercase tracking-wider text-[11px]">
               CookNow Owner Command Center
             </span>
@@ -692,7 +799,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <span
                 className={`w-1.5 h-1.5 rounded-full ${
                   dbConnectionStatus === 'LIVE'
-                    ? 'bg-emerald-400 animate-pulse'
+                    ? 'bg-emerald-400'
                     : dbConnectionStatus === 'CACHED'
                     ? 'bg-amber-400'
                     : 'bg-rose-400'
@@ -822,11 +929,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
 
               <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200/80 space-y-1">
-                <span className="text-[11px] font-semibold text-slate-500 uppercase block">Current Month Run</span>
+                <span className="text-[11px] font-semibold text-slate-500 uppercase block">This Month Run</span>
                 <div className="text-lg font-bold font-mono text-slate-900 tabular-nums">
-                  ₹{netPlatformRevenue}
+                  ₹{thisMonthNetRevenue}
                 </div>
-                <span className="text-[10px] text-slate-500 block">+15.2% vs prev</span>
+                <span className="text-[10px] text-slate-500 block">
+                  {thisMonthDeliveredCount} delivered this month
+                </span>
               </div>
 
               <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200/80 space-y-1">
@@ -842,7 +951,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <div className="text-lg font-bold font-mono text-slate-800 tabular-nums">
                   ₹{totalOperatingExpenses}
                 </div>
-                <span className="text-[10px] text-slate-500 block">{filteredExpenses.length} logged items</span>
+                <span className="text-[10px] text-slate-500 block">
+                  {activeExpenses.length} active item{activeExpenses.length === 1 ? '' : 's'}
+                </span>
               </div>
 
               <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200/80 space-y-1">
@@ -850,33 +961,35 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <div className="text-lg font-bold font-mono text-amber-700 tabular-nums">
                   ₹{outstandingLiabilities}
                 </div>
-                <span className="text-[10px] text-amber-800 block">Cook & rider dues</span>
+                <span className="text-[10px] text-amber-800 block">Cook &amp; rider dues</span>
               </div>
 
               <div className="p-3.5 bg-emerald-50/70 rounded-xl border border-emerald-200 space-y-1">
-                <span className="text-[11px] font-bold text-emerald-900 uppercase block">Growth Trajectory</span>
+                <span className="text-[11px] font-bold text-emerald-900 uppercase block">Avg Basket &amp; Repeat</span>
                 <div className="text-lg font-black font-mono text-emerald-950 tabular-nums">
-                  +18.5%
+                  ₹{averageOrderValue}
                 </div>
-                <span className="text-[10px] text-emerald-800 block">Orders +31.2%</span>
+                <span className="text-[10px] text-emerald-800 block">
+                  {repeatCustomerRate}% repeat · {deliveredOrders.length} delivered
+                </span>
               </div>
             </div>
 
             {/* 6 Business Health Indicators */}
             <div>
               <div className="text-xs font-semibold text-slate-600 mb-2">
-                Operational & Financial Health Indicators (Nalapani Market)
+                Operational &amp; Financial Health Indicators (Nalapani Market)
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                 <div className="p-3 rounded-xl border border-slate-200 bg-slate-50/60 flex items-start gap-3">
                   <TrendingUp className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                   <div className="space-y-0.5">
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-bold text-slate-900">Revenue Trend:</span>
-                      <span className="text-xs font-semibold text-emerald-700">Growing (+18.5%)</span>
+                      <span className="text-xs font-bold text-slate-900">Customer Retention:</span>
+                      <span className="text-xs font-semibold text-emerald-700">{repeatCustomerRate}% Repeat Rate</span>
                     </div>
                     <p className="text-[11px] text-slate-500 leading-relaxed">
-                      Healthy repeat orders from UPES & DIT students living in PG accommodations.
+                      {uniqueCustomersCount} active customers ({repeatCustomersCount} repeat buyers) with ₹{averageOrderValue} AOV.
                     </p>
                   </div>
                 </div>
@@ -897,14 +1010,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </div>
 
                 <div className="p-3 rounded-xl border border-slate-200 bg-slate-50/60 flex items-start gap-3">
-                  <CreditCard className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <CreditCard className={`w-4 h-4 shrink-0 mt-0.5 ${codDeliveredPendingRemittance === 0 ? 'text-emerald-600' : 'text-amber-600'}`} />
                   <div className="space-y-0.5">
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-bold text-slate-900">Cash Collection:</span>
-                      <span className="text-xs font-semibold text-emerald-700">100% COD Reconciled</span>
+                      <span className={`text-xs font-semibold ${codDeliveredPendingRemittance === 0 ? 'text-emerald-700' : 'text-amber-800'}`}>
+                        {codDeliveredPendingRemittance === 0
+                          ? '100% COD Reconciled'
+                          : `₹${codDeliveredPendingRemittance} Pending Remittance`}
+                      </span>
                     </div>
                     <p className="text-[11px] text-slate-500 leading-relaxed">
-                      ₹{cashCollected} collected on delivery; ₹{cashInTransit} currently in courier transit.
+                      ₹{cashCollected} remitted; ₹{cashInTransit} in transit; ₹{codDeliveredPendingRemittance} awaiting hub handover.
                     </p>
                   </div>
                 </div>
@@ -917,7 +1034,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <span className="text-xs font-semibold text-amber-800">₹{outstandingLiabilities} Scheduled</span>
                     </div>
                     <p className="text-[11px] text-slate-500 leading-relaxed">
-                      Next bi-weekly settlement scheduled for Nalapani home cooks and delivery fleet.
+                      Cook dues: ₹{outstandingCooksOwed} · Rider dues: ₹{outstandingRidersOwed}.
                     </p>
                   </div>
                 </div>
@@ -927,25 +1044,54 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <div className="space-y-0.5">
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-bold text-slate-900">Kitchen Fulfillment:</span>
-                      <span className="text-xs font-semibold text-emerald-700">4.8 / 5.0 Rating</span>
+                      <span className="text-xs font-semibold text-emerald-700">{averageKitchenRating} / 5.0 Rating</span>
                     </div>
                     <p className="text-[11px] text-slate-500 leading-relaxed">
-                      Zero hygiene complaints; 100% FSSAI compliance across verified kitchens.
+                      {cooks.filter((c) => c.isAcceptingOrders).length} of {cooks.length} kitchens open · {cooks.filter((c) => c.isVerified).length} verified kitchens.
                     </p>
                   </div>
                 </div>
 
-                <div className="p-3 rounded-xl border border-slate-200 bg-slate-50/60 flex items-start gap-3">
-                  <Bike className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <div className="space-y-0.5">
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-bold text-slate-900">Fleet Logistics Speed:</span>
-                      <span className="text-xs font-semibold text-emerald-700">24 Min Avg Transit</span>
+                <div className="p-3 rounded-xl border border-slate-200 bg-slate-50/60 flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <Headphones
+                      className={`w-4 h-4 shrink-0 mt-0.5 ${
+                        supportStats && supportStats.urgentActiveTickets > 0
+                          ? 'text-rose-600'
+                          : 'text-emerald-600'
+                      }`}
+                    />
+                    <div className="space-y-0.5">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold text-slate-900">Support Queue:</span>
+                        <span
+                          className={`text-xs font-semibold ${
+                            supportStats && supportStats.urgentActiveTickets > 0
+                              ? 'text-rose-700'
+                              : 'text-emerald-700'
+                          }`}
+                        >
+                          {supportStats
+                            ? `${supportStats.openTickets + supportStats.inProgressTickets + supportStats.waitingForCustomerTickets} Active${
+                                supportStats.urgentActiveTickets > 0 ? ` (${supportStats.urgentActiveTickets} Urgent)` : ''
+                              }`
+                            : `${complaints.filter((c) => c.status !== 'resolved').length} Active`}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-500 leading-relaxed">
+                        {supportStats && supportStats.avgSatisfactionRating !== null
+                          ? `CSAT ${supportStats.avgSatisfactionRating}/5.0 across ${supportStats.totalTickets} tickets.`
+                          : 'Live Firestore customer care tickets & refund audits.'}
+                      </p>
                     </div>
-                    <p className="text-[11px] text-slate-500 leading-relaxed">
-                      Consistent delivery speed across Raipur Road, Tapovan, and Upper Nalapani.
-                    </p>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('customer-care')}
+                    className="px-2.5 py-1 text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-white rounded-lg whitespace-nowrap shrink-0 cursor-pointer transition-colors"
+                  >
+                    Open Support
+                  </button>
                 </div>
               </div>
             </div>
@@ -1014,7 +1160,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       </div>
 
       {/* ---------------------------------------------------------------------- */}
-      {/* 15 COMPREHENSIVE MANAGEMENT TABS                                       */}
+      {/* 16 MANAGEMENT TABS                                                     */}
       {/* ---------------------------------------------------------------------- */}
       <div className="flex items-center gap-1.5 border-b border-slate-200 pb-2 overflow-x-auto">
         {(
@@ -1088,7 +1234,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs space-y-1">
               <span className="text-[11px] font-semibold text-slate-500 uppercase">Active Orders</span>
               <div className="text-xl font-bold font-mono text-amber-700 tabular-nums">{activeOrders.length}</div>
-              <span className="text-[10px] text-amber-800">In cooking & transit</span>
+              <span className="text-[10px] text-amber-800 block">
+                Cooking & transit
+                {awaitingKitchenOrders.length > 0 ? ` · +${awaitingKitchenOrders.length} pending/accepted` : ''}
+              </span>
             </div>
 
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs space-y-1">
@@ -1160,41 +1309,70 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                 <div>
                   <h3 className="font-bold text-sm text-slate-900">Real-Time Activity Stream</h3>
-                  <p className="text-xs text-slate-500">Live order status transitions and customer dispatch events</p>
+                  <p className="text-xs text-slate-500">
+                    Historical order status transitions (newest first) paired with each order&apos;s live status
+                  </p>
                 </div>
                 <span className="text-[11px] text-slate-400 font-mono tabular-nums">
-                  {filteredOrders.length} logged events
+                  {activityStreamEvents.length} logged events
                 </span>
               </div>
 
               <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
-                {filteredOrders.flatMap((o) =>
-                  o.events.map((evt, idx) => (
-                    <div
-                      key={`${o.id}-${idx}`}
-                      className="p-3 bg-slate-50 hover:bg-slate-100/80 rounded-xl border border-slate-200/70 transition-colors flex items-start justify-between gap-3 text-xs"
-                    >
-                      <div className="space-y-0.5">
-                        <div className="flex items-center gap-2">
-                          <strong className="text-slate-900 font-mono text-[11px]">{o.id}</strong>
-                          <span className="text-slate-400">·</span>
-                          <span className="font-semibold text-slate-800">{o.kitchenName}</span>
-                          <span className="text-slate-400">→</span>
-                          <span className="text-slate-600">{o.customerName}</span>
-                        </div>
-                        <p className="text-slate-600 text-[11px]">{evt.note}</p>
-                      </div>
+                {activityStreamEvents.length === 0 ? (
+                  <div className="p-4 text-center text-xs text-slate-500 bg-slate-50 rounded-xl border border-slate-200/70">
+                    No activity events recorded for the selected time range.
+                  </div>
+                ) : (
+                  activityStreamEvents.map((evt) => {
+                    const currentBadgeClass =
+                      evt.currentOrderStatus === 'delivered'
+                        ? 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                        : evt.currentOrderStatus === 'cancelled'
+                        ? 'bg-rose-100 text-rose-800 border-rose-200'
+                        : ['preparing', 'ready', 'out_for_delivery'].includes(evt.currentOrderStatus)
+                        ? 'bg-amber-100 text-amber-900 border-amber-300'
+                        : 'bg-slate-200 text-slate-800 border-slate-300';
 
-                      <div className="text-right shrink-0">
-                        <span className="text-[10px] font-mono text-slate-400 block tabular-nums">
-                          {new Date(evt.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
-                        </span>
-                        <span className="text-[10px] uppercase font-semibold text-slate-500">
-                          {evt.status}
-                        </span>
+                    return (
+                      <div
+                        key={evt.key}
+                        className="p-3 bg-slate-50 hover:bg-slate-100/80 rounded-xl border border-slate-200/70 transition-colors flex items-start justify-between gap-3 text-xs"
+                      >
+                        <div className="space-y-1 min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <strong className="text-slate-900 font-mono text-[11px]">{evt.orderId}</strong>
+                            <span
+                              className={`text-[10px] font-bold uppercase px-1.5 py-0.5 rounded border ${currentBadgeClass}`}
+                              title="Current live status from latest Firestore order document"
+                            >
+                              Current: {formatOrderStatusLabel(evt.currentOrderStatus)}
+                            </span>
+                            <span className="text-slate-400">·</span>
+                            <span className="font-semibold text-slate-800">{evt.kitchenName}</span>
+                            <span className="text-slate-400">→</span>
+                            <span className="text-slate-600">{evt.customerName}</span>
+                          </div>
+                          <p className="text-slate-600 text-[11px]">{evt.note}</p>
+                        </div>
+
+                        <div className="text-right shrink-0">
+                          <span className="text-[10px] font-mono text-slate-500 block tabular-nums">
+                            {new Date(evt.timestampIso).toLocaleString('en-IN', {
+                              day: '2-digit',
+                              month: 'short',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              second: '2-digit',
+                            })}
+                          </span>
+                          <span className="text-[10px] uppercase font-semibold text-slate-500">
+                            Event: {formatOrderStatusLabel(evt.eventStatus)}
+                          </span>
+                        </div>
                       </div>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
               </div>
             </div>
@@ -1509,45 +1687,45 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </div>
                 <div className="space-y-1.5 pl-2 text-slate-600">
                   <div className="flex justify-between">
-                    <span>Packaging Subsidies & Supplies:</span>
+                    <span>Packaging Subsidies &amp; Supplies:</span>
                     <span className="font-mono tabular-nums">
-                      -₹{filteredExpenses.filter((e) => e.category === 'packaging_subsidies').reduce((s, e) => s + e.amount, 0)}
+                      -₹{activeExpenses.filter((e) => e.category === 'packaging_subsidies').reduce((s, e) => s + e.amount, 0)}
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span>Kitchen Hygiene, Water Testing & Audits:</span>
+                    <span>Kitchen Hygiene, Water Testing &amp; Audits:</span>
                     <span className="font-mono tabular-nums">
-                      -₹{filteredExpenses.filter((e) => e.category === 'ops_hygiene_inspection').reduce((s, e) => s + e.amount, 0)}
+                      -₹{activeExpenses.filter((e) => e.category === 'ops_hygiene_inspection').reduce((s, e) => s + e.amount, 0)}
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span>Student Marketing & Campus Outreach:</span>
+                    <span>Student Marketing &amp; Campus Outreach:</span>
                     <span className="font-mono tabular-nums">
-                      -₹{filteredExpenses.filter((e) => e.category === 'marketing_student_camps').reduce((s, e) => s + e.amount, 0)}
+                      -₹{activeExpenses.filter((e) => e.category === 'marketing_student_camps').reduce((s, e) => s + e.amount, 0)}
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span>Software Platform, Hosting & Server:</span>
+                    <span>Software Platform, Hosting &amp; Server:</span>
                     <span className="font-mono tabular-nums">
-                      -₹{filteredExpenses.filter((e) => e.category === 'software_platform').reduce((s, e) => s + e.amount, 0)}
+                      -₹{activeExpenses.filter((e) => e.category === 'software_platform').reduce((s, e) => s + e.amount, 0)}
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span>Staff Salaries & Operations:</span>
+                    <span>Staff Salaries &amp; Operations:</span>
                     <span className="font-mono tabular-nums">
-                      -₹{filteredExpenses.filter((e) => e.category === 'salaries').reduce((s, e) => s + e.amount, 0)}
+                      -₹{activeExpenses.filter((e) => e.category === 'salaries').reduce((s, e) => s + e.amount, 0)}
                     </span>
                   </div>
                   <div className="flex justify-between">
                     <span>Customer Courtesy Refunds:</span>
                     <span className="font-mono tabular-nums">
-                      -₹{filteredExpenses.filter((e) => e.category === 'refunds').reduce((s, e) => s + e.amount, 0)}
+                      -₹{activeExpenses.filter((e) => e.category === 'refunds').reduce((s, e) => s + e.amount, 0)}
                     </span>
                   </div>
                   <div className="flex justify-between">
                     <span>Other Operating Costs:</span>
                     <span className="font-mono tabular-nums">
-                      -₹{filteredExpenses.filter((e) => e.category === 'other' || e.category === 'logistics_partner_payout').reduce((s, e) => s + e.amount, 0)}
+                      -₹{activeExpenses.filter((e) => e.category === 'other' || e.category === 'logistics_partner_payout').reduce((s, e) => s + e.amount, 0)}
                     </span>
                   </div>
                 </div>
@@ -1741,10 +1919,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
             <div className="p-4 border-b border-slate-200 flex justify-between items-center text-xs">
               <span className="font-semibold text-slate-700">
-                Logged Expenses ({filteredExpenses.filter((e) => expenseFilterCategory === 'all' || e.category === expenseFilterCategory).length} items)
+                Active Expenses ({activeExpenses.filter((e) => expenseFilterCategory === 'all' || e.category === expenseFilterCategory).length} active · {reversedExpenses.filter((e) => expenseFilterCategory === 'all' || e.category === expenseFilterCategory).length} reversed)
               </span>
               <span className="font-mono font-bold text-slate-900 tabular-nums">
-                Total: ₹{filteredExpenses.filter((e) => expenseFilterCategory === 'all' || e.category === expenseFilterCategory).reduce((sum, e) => sum + e.amount, 0)}
+                Active Total: ₹{activeExpenses.filter((e) => expenseFilterCategory === 'all' || e.category === expenseFilterCategory).reduce((sum, e) => sum + e.amount, 0)}
               </span>
             </div>
 
@@ -1877,7 +2055,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     : 'bg-slate-100 text-slate-600 hover:text-slate-900 hover:bg-slate-200'
                 }`}
               >
-                {label} ({orders.filter((o) => st === 'all' || o.status === st).length})
+                {label} ({filteredOrders.filter((o) => st === 'all' || getLatestOrderStatus(o) === st).length})
               </button>
             ))}
           </div>
@@ -1902,15 +2080,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-mono">
                   {filteredOrders
-                    .filter((o) => orderStatusFilter === 'all' || o.status === orderStatusFilter)
-                    .map((ord) => (
+                    .filter((o) => orderStatusFilter === 'all' || getLatestOrderStatus(o) === orderStatusFilter)
+                    .map((ord) => {
+                      const ordStatus = getLatestOrderStatus(ord);
+                      return (
                       <tr key={ord.id} className="hover:bg-slate-50/70 transition-colors">
                         <td className="p-3 font-bold text-slate-900">{ord.id}</td>
                         <td className="p-3 text-slate-500 whitespace-nowrap">
                           {new Date(ord.createdAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
                         </td>
                         <td className="p-3 font-sans">
-                          {ord.status === 'delivered' ? (
+                          {ordStatus === 'delivered' ? (
                             ord.paymentMethod === 'cod' && ord.paymentStatus !== 'paid' ? (
                               <span className="px-2 py-0.5 rounded text-[10px] font-semibold uppercase bg-amber-100 text-amber-900 border border-amber-300">
                                 Delivered · COD Pending
@@ -1923,14 +2103,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           ) : (
                             <span
                               className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase ${
-                                ord.status === 'cancelled'
+                                ordStatus === 'cancelled'
                                   ? 'bg-rose-100 text-rose-800'
-                                  : ord.status === 'ready'
+                                  : ordStatus === 'ready' || ordStatus === 'preparing' || ordStatus === 'out_for_delivery'
                                   ? 'bg-amber-100 text-amber-800'
                                   : 'bg-slate-100 text-slate-800'
                               }`}
                             >
-                              {ord.status.replace(/_/g, ' ')}
+                              {ordStatus.replace(/_/g, ' ')}
                             </span>
                           )}
                         </td>
@@ -1949,7 +2129,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           )}
                         </td>
                         <td className="p-3 font-sans text-right whitespace-nowrap">
-                          {ord.status === 'delivered' && ord.paymentMethod === 'cod' && ord.paymentStatus !== 'paid' && (
+                          {ordStatus === 'delivered' && ord.paymentMethod === 'cod' && ord.paymentStatus !== 'paid' && (
                             <button
                               onClick={() => onConfirmCODRemittance?.(ord.id)}
                               className="px-2.5 py-1 text-emerald-800 hover:text-emerald-950 bg-emerald-100 hover:bg-emerald-200 border border-emerald-300 rounded font-bold text-[11px] cursor-pointer mr-1"
@@ -1966,7 +2146,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             Inspect
                           </button>
 
-                          {ord.status !== 'delivered' && ord.status !== 'cancelled' && (
+                          {ordStatus !== 'delivered' && ordStatus !== 'cancelled' && (
                             <button
                               onClick={() => {
                                 setCancellingOrderId(ord.id);
@@ -1979,7 +2159,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           )}
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                 </tbody>
               </table>
             </div>
@@ -2475,7 +2656,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                 const refNum = `UPI-TXN-${Date.now().toString().slice(-6)}`;
                                 setSettledPayouts((prev) => ({
                                   ...prev,
-                                  [c.id]: { settledAt: new Date().toISOString(), ref: refNum },
+                                  [c.id]: {
+                                    settledAt: new Date().toISOString(),
+                                    ref: refNum,
+                                    amount: netPayout,
+                                    targetType: 'cook',
+                                  },
                                 }));
                                 await firestoreService.recordSettlement({
                                   targetType: 'cook',
@@ -2485,6 +2671,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                   referenceNumber: refNum,
                                   settledBy: OWNER_PROFILE.fullName,
                                 });
+                                onNotify?.(`Recorded ₹${netPayout} payout for ${c.kitchenName} (${refNum}).`);
                               }}
                               className="px-2.5 py-1 bg-emerald-800 hover:bg-emerald-900 text-white rounded text-[11px] font-medium cursor-pointer"
                             >
@@ -2536,18 +2723,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             <button
                               onClick={async () => {
                                 const refNum = `UPI-RIDER-${Date.now().toString().slice(-6)}`;
+                                const riderDue = dp.totalDeliveries * settings.standardDeliveryFee;
                                 setSettledPayouts((prev) => ({
                                   ...prev,
-                                  [dp.id]: { settledAt: new Date().toISOString(), ref: refNum },
+                                  [dp.id]: {
+                                    settledAt: new Date().toISOString(),
+                                    ref: refNum,
+                                    amount: riderDue,
+                                    targetType: 'rider',
+                                  },
                                 }));
                                 await firestoreService.recordSettlement({
                                   targetType: 'rider',
                                   targetId: dp.id,
                                   targetName: dp.fullName,
-                                  amount: dp.totalDeliveries * settings.standardDeliveryFee,
+                                  amount: riderDue,
                                   referenceNumber: refNum,
                                   settledBy: OWNER_PROFILE.fullName,
                                 });
+                                onNotify?.(`Recorded ₹${riderDue} payout for courier ${dp.fullName} (${refNum}).`);
                               }}
                               className="px-2.5 py-1 bg-emerald-800 hover:bg-emerald-900 text-white rounded text-[11px] font-medium cursor-pointer"
                             >
@@ -2749,8 +2943,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-4 shadow-xs">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                  <h3 className="text-sm font-bold text-slate-900">
                     Cloud Firestore (PRIMARY DATABASE)
                   </h3>
                   <p className="text-slate-500 text-[11px]">Primary catalog, orders &amp; financial ledger (Google Cloud)</p>
@@ -2808,8 +3001,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-4 shadow-xs">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-slate-400" />
+                  <h3 className="text-sm font-bold text-slate-900">
                     Supabase PostgreSQL (Optional Standby)
                   </h3>
                   <p className="text-slate-500 text-[11px]">Optional archive only · Not required for live operations</p>
@@ -2863,6 +3055,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           orders={orders}
           deliveryPartners={deliveryPartners}
           onInspectOrder={(order) => setSelectedOrder(order)}
+          onNotify={onNotify}
           onStatsChange={setSupportStats}
         />
       )}
